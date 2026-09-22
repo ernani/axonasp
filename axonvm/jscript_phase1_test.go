@@ -25,6 +25,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"g3pix.com.br/axonasp/v2/axonvm/asp"
 )
@@ -1109,9 +1110,9 @@ func TestJScriptNumberCoercionViaASP(t *testing.T) {
 	}
 }
 
-// TestValueToStringEmptyRequestCollection verifies that valueToString returns ""
-// for a VTNativeObject wrapping an empty RequestCollectionValue, regardless of
-// whether the caller is in JS or VBS mode.
+// TestValueToStringEmptyRequestCollection verifies that VB-compatible string
+// conversion remains empty while JScript observes a missing collection value
+// as undefined.
 func TestValueToStringEmptyRequestCollection(t *testing.T) {
 	vm := NewVM([]byte{}, nil, 0)
 	host := NewMockHost()
@@ -1129,10 +1130,21 @@ func TestValueToStringEmptyRequestCollection(t *testing.T) {
 		t.Errorf("valueToString(empty RequestCollectionValue) = %q, want %q", result, "")
 	}
 
-	// Also verify jsToString path reaches the same result.
+	// JScript preserves the missing-value distinction.
 	jsResult := vm.jsToString(nativeVal)
-	if jsResult != "" {
-		t.Errorf("jsToString(empty RequestCollectionValue) = %q, want %q", jsResult, "")
+	if jsResult != "undefined" {
+		t.Errorf("jsToString(empty RequestCollectionValue) = %q, want %q", jsResult, "undefined")
+	}
+}
+
+func TestJScriptStringDateUsesLegacyDateRepresentation(t *testing.T) {
+	vm := NewVM([]byte{}, nil, 0)
+	vm.SetHost(NewMockHost())
+	date := NewDate(time.Date(2019, time.September, 18, 5, 40, 33, 0, time.UTC))
+
+	got := vm.jsToString(date)
+	if !strings.Contains(got, "Sep 18 05:40:33") || !strings.HasSuffix(got, " 2019") {
+		t.Fatalf("unexpected JScript date string: %q", got)
 	}
 }
 

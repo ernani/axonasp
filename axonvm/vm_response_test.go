@@ -43,6 +43,28 @@ func TestVMResponseWriteAndProperties(t *testing.T) {
 	}
 }
 
+func TestVMResponseCodePageUpdatesResponseAndSession(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	host := NewMockHost()
+	vm.SetHost(host)
+
+	vm.dispatchNativeCall(nativeObjectResponse, "CodePage", []Value{NewInteger(1252)})
+	if got := host.Response().GetCodePage(); got != 1252 {
+		t.Fatalf("response code page = %d, want 1252", got)
+	}
+	if got := host.Session().GetCodePage(); got != 1252 {
+		t.Fatalf("session code page = %d, want 1252", got)
+	}
+
+	vm.dispatchMemberSet(nativeObjectResponse, "CodePage", NewInteger(65001))
+	if got := host.Response().GetCodePage(); got != 65001 {
+		t.Fatalf("response code page after property set = %d, want 65001", got)
+	}
+	if got := host.Session().GetCodePage(); got != 65001 {
+		t.Fatalf("session code page after property set = %d, want 65001", got)
+	}
+}
+
 // TestVMResponseCookies verifies cookie dispatch methods.
 func TestVMResponseCookies(t *testing.T) {
 	vm := NewVM(nil, nil, 5)

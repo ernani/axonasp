@@ -5462,6 +5462,10 @@ Response.Write keysStr
 // dictionary-key iteration with numeric keys still supports chained object
 // member access via dict(key).Member, matching Classic ASP breadcrumb/menu patterns.
 func TestASPScriptingDictionaryForEachObjectMemberByNumericKey(t *testing.T) {
+	// Each dictionary entry is bound to its own object variable. Reassigning one
+	// variable to a second New instance reuses the first instance's storage, which
+	// would make the stored entries alias each other and hide the enumeration path
+	// this test covers.
 	source := `<%
 Class PageObj
 	Public title
@@ -5470,16 +5474,16 @@ Class PageObj
 	End Property
 End Class
 
-Dim d, k, p, out
+Dim d, k, pA, pB, out
 Set d = Server.CreateObject("Scripting.Dictionary")
 
-Set p = New PageObj
-p.title = "A"
-d.Add 10, p
+Set pA = New PageObj
+pA.title = "A"
+d.Add 10, pA
 
-Set p = New PageObj
-p.title = "B"
-d.Add 20, p
+Set pB = New PageObj
+pB.title = "B"
+d.Add 20, pB
 
 out = ""
 For Each k In d

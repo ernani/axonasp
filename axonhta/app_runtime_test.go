@@ -118,7 +118,7 @@ func TestInjectAppScript_WithHTAHeadElements(t *testing.T) {
 	if !strings.Contains(result, `<link rel="icon" href="favicon.ico">`) {
 		t.Error("expected icon tag to be injected into head")
 	}
-	if !strings.Contains(result, `<style>html, body { border: 3px outset #c0c0c0; box-sizing: border-box; } html, body { overflow: hidden !important; }</style>`) {
+	if !strings.Contains(result, `<style>html { border: 3px outset #c0c0c0; box-sizing: border-box;; width: 100%; height: 100%; } html { overflow: hidden !important; }</style>`) {
 		t.Error("expected HTA style block to be injected")
 	}
 	if !strings.Contains(result, `__heartbeat__`) {

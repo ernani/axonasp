@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"unsafe"
 
 	"g3pix.com.br/axonasp/v2/axonconfig"
 	"g3pix.com.br/axonasp/v2/axonvm"
@@ -198,7 +197,6 @@ End If
 
 	// Provision scriptCache if needed
 	a.scriptCache = axonvm.NewScriptCache(axonvm.BytecodeCacheMemoryOnly, "", 64)
-	a.vmPools = &vmPoolManager{pools: make(map[string]unsafe.Pointer)}
 	a.application = asp.NewApplication()
 
 	rec = httptest.NewRecorder()
@@ -206,5 +204,115 @@ End If
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("POST /g3al valid session: expected %d, got %d. Body: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+}
+
+// TestResolveRuntimeVersionPrefersInjectedValue verifies a linker injected version
+// always wins over the build info derived fallback.
+func TestResolveRuntimeVersionPrefersInjectedValue(t *testing.T) {
+	previous := Version
+	t.Cleanup(func() { Version = previous })
+
+	Version = "2.3.22.c0935f3"
+	if got := resolveRuntimeVersion(); got != "2.3.22.c0935f3" {
+		t.Fatalf("expected injected version, got %q", got)
+	}
+}
+
+// TestResolveRuntimeVersionFallsBackToBuildInfo verifies a bare xcaddy build still
+// reports an AxonASP version instead of the unset default.
+func TestResolveRuntimeVersionFallsBackToBuildInfo(t *testing.T) {
+	previous := Version
+	t.Cleanup(func() { Version = previous })
+
+	Version = ""
+	got := resolveRuntimeVersion()
+	if !strings.HasPrefix(got, axonaspVersionLine+".") {
+		t.Fatalf("expected version to start with %q, got %q", axonaspVersionLine+".", got)
+	}
+	if strings.TrimSpace(got) == "" {
+		t.Fatalf("expected a resolved version, got %q", got)
+	}
+}
+
+// TestNormalizeBuildVersion covers release tags and the pseudo-versions xcaddy
+// records for local modules.
+func TestNormalizeBuildVersion(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{input: "v2.3.22", want: "2.3.22"},
+		{input: "2.3.22", want: "2.3.22"},
+		{input: "v0.0.0-20260907212856-9ded92f3cc7a", want: "2.3.0.9ded92f"},
+		{input: "v0.0.0", want: ""},
+		{input: "", want: ""},
+	}
+
+	for _, tc := range cases {
+		if got := normalizeBuildVersion(tc.input); got != tc.want {
+			t.Errorf("normalizeBuildVersion(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+// TestAcquireVMReusesPooledInstances guards the pooling contract of the handler:
+// a released VM must be handed back for the next request instead of allocating a
+// brand new interpreter instance.
+func TestAcquireVMReusesPooledInstances(t *testing.T) {
+	tempDir := t.TempDir()
+	page := filepath.Join(tempDir, "pool.asp")
+	if err := os.WriteFile(page, []byte("<% Response.Write \"pool\" %>"), 0644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+
+	site := &AxonASP{scriptCache: axonvm.NewScriptCache(axonvm.BytecodeCacheMemoryOnly, "", 4)}
+	program, err := site.scriptCache.LoadOrCompileWithOptions(page, axonvm.ScriptCompileOptions{})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	first := site.AcquireVM(program)
+	first.Release()
+
+	second := site.AcquireVM(program)
+	defer second.Release()
+
+	if first != second {
+		t.Fatalf("expected the released VM instance to be reused by the next request")
+	}
+}
+
+// TestCleanupReleasesRuntimeResources ensures module unload drops pooled VMs and
+// leaves the handler able to serve again if Caddy re-provisions it.
+func TestCleanupReleasesRuntimeResources(t *testing.T) {
+	tempDir := t.TempDir()
+	page := filepath.Join(tempDir, "cleanup.asp")
+	if err := os.WriteFile(page, []byte("<% Response.Write \"cleanup\" %>"), 0644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+
+	site := &AxonASP{scriptCache: axonvm.NewScriptCache(axonvm.BytecodeCacheMemoryOnly, "", 4)}
+	program, err := site.scriptCache.LoadOrCompileWithOptions(page, axonvm.ScriptCompileOptions{})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	idle := site.AcquireVM(program)
+	idle.Release()
+
+	if err := site.Cleanup(); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	reused := site.AcquireVM(program)
+	defer reused.Release()
+	if reused == idle {
+		t.Fatalf("expected Cleanup to purge the retained VM instance")
+	}
+
+	// Cleanup must stay idempotent: Caddy can unload the same module twice.
+	if err := site.Cleanup(); err != nil {
+		t.Fatalf("second cleanup: %v", err)
 	}
 }

@@ -150,18 +150,38 @@ func TestServeErrorPageHTMLPreservesStatus(t *testing.T) {
 	}
 }
 
-// TestWithServerHeaderSetsAxonASPValue verifies the HTTP runtime always emits Server: AxonASP.
-func TestWithServerHeaderSetsAxonASPValue(t *testing.T) {
+// TestWithServerHeadersSetsAxonASPValues verifies the default identifying headers.
+func TestWithServerHeadersSetsAxonASPValues(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "http://example.local/", nil)
-	handler := withServerHeader(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := withServerHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
-	}))
+	}), true)
 
 	handler.ServeHTTP(rec, req)
 
 	if got := rec.Header().Get("Server"); got != "AxonASP" {
 		t.Fatalf("expected Server header AxonASP, got %q", got)
+	}
+	if got := rec.Header().Get("X-Powered-By"); got != "AxonASP" {
+		t.Fatalf("expected X-Powered-By header AxonASP, got %q", got)
+	}
+}
+
+func TestWithServerHeadersCanSuppressIdentifyingHeaders(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://example.local/", nil)
+	handler := withServerHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), false)
+
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Server"); got != "" {
+		t.Fatalf("expected no Server header, got %q", got)
+	}
+	if got := rec.Header().Get("X-Powered-By"); got != "" {
+		t.Fatalf("expected no X-Powered-By header, got %q", got)
 	}
 }
 

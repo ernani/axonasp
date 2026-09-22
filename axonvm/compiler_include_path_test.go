@@ -172,3 +172,13 @@ func TestCompilerCompilesRealPageFileIncludes(t *testing.T) {
 		t.Fatalf("compile failed: %v", err)
 	}
 }
+
+func TestCompilerSupportsCRLFContinuationBeforeAsterisk(t *testing.T) {
+	source := "<%@ Language=\"JScript\" %><%\r\n" +
+		"var query = \"select one \\\r\n" +
+		" having count(*) = 1\";\r\n%>"
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+}

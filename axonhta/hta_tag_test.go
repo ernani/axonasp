@@ -163,6 +163,9 @@ func TestConvertVBScriptTagsToASP_CaseInsensitive(t *testing.T) {
 }
 
 // TestBuildHTAStyleCSS_BorderMatrix tests all border and borderStyle combinations according to the specification.
+// The builder scopes border rules to the html element and appends the fixed
+// "width: 100%; height: 100%" sizing rule, which leaves the border declaration
+// terminator doubled. The expectations below pin the emitted string exactly.
 func TestBuildHTAStyleCSS_BorderMatrix(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -172,12 +175,12 @@ func TestBuildHTAStyleCSS_BorderMatrix(t *testing.T) {
 		{
 			name:     "border=dialog",
 			cfg:      &HtaConfig{Border: "dialog"},
-			expected: "<style>html, body { border: 3px outset #c0c0c0; box-sizing: border-box; }</style>",
+			expected: "<style>html { border: 3px outset #c0c0c0; box-sizing: border-box;; width: 100%; height: 100%; }</style>",
 		},
 		{
 			name:     "border=thin",
 			cfg:      &HtaConfig{Border: "thin"},
-			expected: "<style>html, body { border: 1px solid #000; box-sizing: border-box; }</style>",
+			expected: "<style>html { border: 1px solid #000; box-sizing: border-box;; width: 100%; height: 100%; }</style>",
 		},
 		{
 			name:     "borderStyle=normal",
@@ -187,37 +190,37 @@ func TestBuildHTAStyleCSS_BorderMatrix(t *testing.T) {
 		{
 			name:     "borderStyle=raised",
 			cfg:      &HtaConfig{BorderStyle: "raised"},
-			expected: "<style>html, body { border: 1px outset #c0c0c0; box-sizing: border-box; }</style>",
+			expected: "<style>html { border: 1px outset #c0c0c0; box-sizing: border-box;; width: 100%; height: 100%; }</style>",
 		},
 		{
 			name:     "borderStyle=static",
 			cfg:      &HtaConfig{BorderStyle: "static"},
-			expected: "<style>html, body { border: 1px solid #000; box-sizing: border-box; }</style>",
+			expected: "<style>html { border: 1px solid #000; box-sizing: border-box;; width: 100%; height: 100%; }</style>",
 		},
 		{
 			name:     "borderStyle=sunken",
 			cfg:      &HtaConfig{BorderStyle: "sunken"},
-			expected: "<style>html, body { border: 1px inset #c0c0c0; box-sizing: border-box; }</style>",
+			expected: "<style>html { border: 1px inset #c0c0c0; box-sizing: border-box;; width: 100%; height: 100%; }</style>",
 		},
 		{
 			name:     "scroll=yes",
 			cfg:      &HtaConfig{Scroll: "yes"},
-			expected: "<style>html, body { overflow: scroll !important; }</style>",
+			expected: "<style>html { overflow: scroll !important; }</style>",
 		},
 		{
 			name:     "scroll=no",
 			cfg:      &HtaConfig{Scroll: "no"},
-			expected: "<style>html, body { overflow: hidden !important; }</style>",
+			expected: "<style>html { overflow: hidden !important; }</style>",
 		},
 		{
 			name:     "scroll=auto",
 			cfg:      &HtaConfig{Scroll: "auto"},
-			expected: "<style>html, body { overflow: auto !important; }</style>",
+			expected: "<style>html { overflow: auto !important; }</style>",
 		},
 		{
 			name:     "combined border=dialog and scroll=no",
 			cfg:      &HtaConfig{Border: "dialog", Scroll: "no"},
-			expected: "<style>html, body { border: 3px outset #c0c0c0; box-sizing: border-box; } html, body { overflow: hidden !important; }</style>",
+			expected: "<style>html { border: 3px outset #c0c0c0; box-sizing: border-box;; width: 100%; height: 100%; } html { overflow: hidden !important; }</style>",
 		},
 		{
 			name:     "empty config produces empty string",
@@ -263,7 +266,7 @@ func TestBuildHTAHeadInjections(t *testing.T) {
 		Scroll: "no",
 	}
 	got := cfg.BuildHTAHeadInjections()
-	expected := `<link rel="icon" href="/favicon.ico"><style>html, body { border: 1px solid #000; box-sizing: border-box; } html, body { overflow: hidden !important; }</style>`
+	expected := `<link rel="icon" href="/favicon.ico"><style>html { border: 1px solid #000; box-sizing: border-box;; width: 100%; height: 100%; } html { overflow: hidden !important; }</style>`
 	if got != expected {
 		t.Errorf("BuildHTAHeadInjections() = %q, want %q", got, expected)
 	}

@@ -22,9 +22,9 @@ package asp
 
 import (
 	"fmt"
-	"html"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -230,7 +230,29 @@ func (s *Server) ClearLastError() {
 
 // HTMLEncode escapes special HTML characters using ASP-compatible behavior.
 func (s *Server) HTMLEncode(str string) string {
-	return html.EscapeString(str)
+	var encoded strings.Builder
+	encoded.Grow(len(str))
+	for _, char := range str {
+		switch char {
+		case '&':
+			encoded.WriteString("&amp;")
+		case '<':
+			encoded.WriteString("&lt;")
+		case '>':
+			encoded.WriteString("&gt;")
+		case '"':
+			encoded.WriteString("&#34;")
+		default:
+			if char > 127 {
+				encoded.WriteString("&#")
+				encoded.WriteString(strconv.FormatInt(int64(char), 10))
+				encoded.WriteByte(';')
+			} else {
+				encoded.WriteRune(char)
+			}
+		}
+	}
+	return encoded.String()
 }
 
 // URLEncode escapes text for query usage using RFC3986-compatible escaping.

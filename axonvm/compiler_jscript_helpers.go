@@ -57,6 +57,18 @@ func jsStatementPreventsLocalSlots(stmt jsast.Statement) bool {
 		}
 	case *jsast.ExpressionStatement:
 		return jsExpressionPreventsLocalSlots(node.Expression)
+	case *jsast.VariableStatement:
+		for _, binding := range node.List {
+			if binding != nil && jsExpressionPreventsLocalSlots(binding.Initializer) {
+				return true
+			}
+		}
+	case *jsast.LexicalDeclaration:
+		for _, binding := range node.List {
+			if binding != nil && jsExpressionPreventsLocalSlots(binding.Initializer) {
+				return true
+			}
+		}
 	case *jsast.IfStatement:
 		if jsExpressionPreventsLocalSlots(node.Test) {
 			return true

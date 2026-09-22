@@ -26,7 +26,7 @@ func TestJScriptDuplicateNestedIncludeDeclarations(t *testing.T) {
 
 	var declarations strings.Builder
 	declarations.WriteString("<%\nvar includeRuns = (typeof includeRuns == 'undefined' ? 0 : includeRuns) + 1;\n")
-	for i := 0; i < 400; i++ {
+	for i := range 400 {
 		fmt.Fprintf(&declarations, "var sharedConstant%03d = %d;\n", i, i)
 	}
 	declarations.WriteString("%>\n")

@@ -76,6 +76,33 @@ func releaseVMPoolSlot(slot chan struct{}) {
 	}
 }
 
+// PurgeVMProgramPools drops every idle VM retained by the interpreter pools and
+// stops their STA workers. Hosted runtimes call this when their module is
+// unloaded so pooled VM instances, dynamic maps and bytecode views do not
+// outlive the owner across configuration reloads.
+func PurgeVMProgramPools() {
+	cachedProgramPools.Range(func(key, value any) bool {
+		cachedProgramPools.Delete(key)
+
+		pool, ok := value.(*vmProgramPool)
+		if !ok || pool == nil {
+			return true
+		}
+
+		pool.mu.Lock()
+		idle := pool.items
+		pool.items = nil
+		pool.mu.Unlock()
+
+		for _, vm := range idle {
+			if vm != nil {
+				vm.stopSTAWorker()
+			}
+		}
+		return true
+	})
+}
+
 // AcquireVMFromCachedProgram borrows one VM instance from the interpreter pool.
 func AcquireVMFromCachedProgram(program CachedProgram) *VM {
 	slot := acquireVMPoolSlot()
@@ -286,6 +313,10 @@ func (vm *VM) captureBaseProgramState() {
 	vm.baseSourceMap = vm.sourceMap.Clone()
 	vm.bytecode = immutableBytecodeView(vm.baseBytecode)
 	vm.constants = immutableValueView(vm.baseConstants)
+	if len(vm.jsFunctionTemplateMetadataCache) > len(vm.baseConstants) {
+		clear(vm.jsFunctionTemplateMetadataCache[len(vm.baseConstants):])
+		vm.jsFunctionTemplateMetadataCache = vm.jsFunctionTemplateMetadataCache[:len(vm.baseConstants)]
+	}
 }
 
 func (vm *VM) resetForReuse() {
@@ -731,6 +762,9 @@ func (vm *VM) ensureDynamicMaps() {
 	if vm.jsRegExpItems == nil {
 		vm.jsRegExpItems = make(map[int64]*jsRegExpObject)
 	}
+	if vm.jsRegExpProgramCache == nil {
+		vm.jsRegExpProgramCache = make(map[jsRegExpCacheKey]jsRegExpCacheEntry)
+	}
 	if vm.regExpMatchesCollectionItems == nil {
 		vm.regExpMatchesCollectionItems = make(map[int64]*regExpMatchesCollection)
 	}
@@ -761,17 +795,20 @@ func (vm *VM) ensureDynamicMaps() {
 	if vm.jsObjectSlots == nil {
 		vm.jsObjectSlots = make(map[int64][]Value)
 	}
-	if vm.jsObjectSlotIndex == nil {
-		vm.jsObjectSlotIndex = make(map[int64]map[string]uint16)
-	}
 	if vm.jsObjectShape == nil {
 		vm.jsObjectShape = make(map[int64]uint32)
 	}
 	if vm.jsShapeSlots == nil {
 		vm.jsShapeSlots = make(map[uint32][]string)
 	}
-	if vm.jsShapeBySignature == nil {
-		vm.jsShapeBySignature = make(map[string]uint32)
+	if vm.jsShapeSlotIndex == nil {
+		vm.jsShapeSlotIndex = make(map[uint32]map[string]uint16)
+	}
+	if vm.jsShapeTransitions == nil {
+		vm.jsShapeTransitions = make(map[jsShapeTransition]uint32)
+	}
+	if vm.jsObjectShapeDisabled == nil {
+		vm.jsObjectShapeDisabled = make(map[int64]struct{})
 	}
 	if vm.jsNextShapeID == 0 {
 		vm.jsNextShapeID = 1
@@ -965,11 +1002,8 @@ func (vm *VM) resetDynamicMaps() {
 	clear(vm.jsObjectKeyOrder)
 	clear(vm.jsObjectKeySet)
 	clear(vm.jsObjectSlots)
-	clear(vm.jsObjectSlotIndex)
 	clear(vm.jsObjectShape)
-	clear(vm.jsShapeSlots)
-	clear(vm.jsShapeBySignature)
-	vm.jsNextShapeID = 1
+	clear(vm.jsObjectShapeDisabled)
 	clear(vm.jsObjectStateItems)
 	clear(vm.jsSymbolStateItems)
 	clear(vm.jsPropertyItems)
@@ -977,6 +1011,9 @@ func (vm *VM) resetDynamicMaps() {
 	clear(vm.jsForInItems)
 	clear(vm.jsForOfItems)
 	clear(vm.jsEnvItems)
+	for i := range vm.jsEnvBindingsPool {
+		clear(vm.jsEnvBindingsPool[i])
+	}
 	clear(vm.jsArgumentsItems)
 	clear(vm.jsSetItems)
 	clear(vm.jsMapItems)

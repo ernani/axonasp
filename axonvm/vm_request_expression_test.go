@@ -481,14 +481,22 @@ Response.Write Request.Form("movies")
 	}
 }
 
-// TestVMRequestFormCollectionItemCountMissing verifies missing form keys still behave as Empty values.
+// TestVMRequestFormCollectionItemCountMissing verifies Classic ASP semantics for a form key that
+// was not posted. Request.Form(key) collapses to a zero-length string instead of the VBScript
+// Empty variant, so IsEmpty is False and TypeName reports String. The parent collection still
+// reports Count 0, while reading .Count on the missing item raises "Object required" (800A01A8)
+// because the item is a plain string and not a collection-value object.
 func TestVMRequestFormCollectionItemCountMissing(t *testing.T) {
 	source := `<%
-If IsEmpty(Request.Form("movies")) Then
-    Response.Write "empty"
-Else
-    Response.Write Request.Form("movies").Count
-End If
+On Error Resume Next
+Dim missing, itemCount
+missing = Request.Form("movies")
+Response.Write IsEmpty(missing) & "|" & TypeName(missing) & "|" & Len(missing) & "|"
+Err.Clear
+itemCount = Request.Form("movies").Count
+Response.Write Hex(Err.Number) & "|"
+Err.Clear
+Response.Write Request.Form.Count
 %>`
 
 	compiler := NewASPCompiler(source)
@@ -507,7 +515,7 @@ End If
 	}
 	host.Response().Flush()
 
-	if output.String() != "empty" {
+	if output.String() != "False|String|0|800A01A8|0" {
 		t.Fatalf("unexpected output: %q", output.String())
 	}
 }

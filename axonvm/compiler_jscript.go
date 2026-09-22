@@ -4191,6 +4191,10 @@ func normalizeJScriptCollectionAssignments(source string) string {
 					result.WriteByte('\\')
 					result.WriteByte(source[i+1])
 					i += 2
+					if source[i-1] == '\r' && i < n && source[i] == '\n' {
+						result.WriteByte('\n')
+						i++
+					}
 					continue
 				}
 				if source[i] == '\r' || source[i] == '\n' {
@@ -4215,6 +4219,10 @@ func normalizeJScriptCollectionAssignments(source string) string {
 					result.WriteByte('\\')
 					result.WriteByte(source[i+1])
 					i += 2
+					if source[i-1] == '\r' && i < n && source[i] == '\n' {
+						result.WriteByte('\n')
+						i++
+					}
 					continue
 				}
 				if source[i] == '\r' || source[i] == '\n' {

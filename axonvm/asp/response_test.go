@@ -168,3 +168,127 @@ func TestResponseBinaryContentTypeOmitsCharset(t *testing.T) {
 		t.Fatalf("unexpected binary body: %v", recorder.Body.Bytes())
 	}
 }
+
+func TestResponseTranscodesBufferedTextToConfiguredCodePage(t *testing.T) {
+	var output bytes.Buffer
+	response := NewResponse(&output)
+	defer response.ReleaseBuffer()
+	response.SetContentType("text/plain")
+	response.SetCodePage(1252)
+	response.SetCharset("windows-1252")
+	response.Write("A1ä|中|😀")
+	response.Flush()
+
+	want := []byte{'A', '1', 0xE4, '|', '?', '|', '?', '?'}
+	if !bytes.Equal(output.Bytes(), want) {
+		t.Fatalf("unexpected Windows-1252 bytes: got %X want %X", output.Bytes(), want)
+	}
+}
+
+func TestResponseDoesNotTranscodeBinaryContent(t *testing.T) {
+	var output bytes.Buffer
+	response := NewResponse(&output)
+	defer response.ReleaseBuffer()
+	response.SetContentType("application/octet-stream")
+	response.SetCodePage(1252)
+	response.BinaryWrite([]byte{0xC3, 0xA4})
+	response.Flush()
+
+	if !bytes.Equal(output.Bytes(), []byte{0xC3, 0xA4}) {
+		t.Fatalf("binary response was transcoded: %X", output.Bytes())
+	}
+}
+
+func TestResponseTranscodesTextWithBinaryContentType(t *testing.T) {
+	var output bytes.Buffer
+	response := NewResponse(&output)
+	defer response.ReleaseBuffer()
+	response.SetContentType("application/octet-stream")
+	response.SetCodePage(1252)
+	response.Write("ä")
+	response.Flush()
+
+	if !bytes.Equal(output.Bytes(), []byte{0xE4}) {
+		t.Fatalf("text write was not transcoded under binary content type: %X", output.Bytes())
+	}
+}
+
+func TestResponseLeavesUTF8TextUnchanged(t *testing.T) {
+	var output bytes.Buffer
+	response := NewResponse(&output)
+	defer response.ReleaseBuffer()
+	response.SetContentType("text/plain")
+	response.SetCodePage(65001)
+	response.Write("ä中😀")
+	response.Flush()
+
+	if output.String() != "ä中😀" {
+		t.Fatalf("UTF-8 response changed: %q", output.String())
+	}
+}
+
+func TestResponseTranscodesOnlyTextSegments(t *testing.T) {
+	var output bytes.Buffer
+	response := NewResponse(&output)
+	defer response.ReleaseBuffer()
+	response.SetContentType("text/plain")
+	response.SetCodePage(1252)
+	response.Write("ä")
+	response.BinaryWrite([]byte{0xC3, 0xA4})
+	response.Write("é")
+	response.Flush()
+
+	want := []byte{0xE4, 0xC3, 0xA4, 0xE9}
+	if !bytes.Equal(output.Bytes(), want) {
+		t.Fatalf("unexpected mixed response bytes: got %X want %X", output.Bytes(), want)
+	}
+}
+
+func TestResponseTextSegmentsRetainCodePageAtWriteTime(t *testing.T) {
+	var output bytes.Buffer
+	response := NewResponse(&output)
+	defer response.ReleaseBuffer()
+	response.SetContentType("text/plain")
+	response.SetCodePage(1252)
+	response.Write("ä")
+	response.SetCodePage(65001)
+	response.Write("ä")
+	response.Flush()
+
+	want := []byte{0xE4, 0xC3, 0xA4}
+	if !bytes.Equal(output.Bytes(), want) {
+		t.Fatalf("unexpected code-page segment bytes: got %X want %X", output.Bytes(), want)
+	}
+}
+
+func TestResponseClearRemovesSegmentMetadata(t *testing.T) {
+	var output bytes.Buffer
+	response := NewResponse(&output)
+	defer response.ReleaseBuffer()
+	response.SetContentType("text/plain")
+	response.SetCodePage(1252)
+	response.Write("ä")
+	response.Clear()
+	response.BinaryWrite([]byte{0xC3, 0xA4})
+	response.Flush()
+
+	if !bytes.Equal(output.Bytes(), []byte{0xC3, 0xA4}) {
+		t.Fatalf("cleared text segment affected binary output: %X", output.Bytes())
+	}
+}
+
+func TestResponseUnbufferedMixedSegments(t *testing.T) {
+	var output bytes.Buffer
+	response := NewResponse(&output)
+	defer response.ReleaseBuffer()
+	response.SetContentType("text/plain")
+	response.SetCodePage(1252)
+	response.SetBuffer(false)
+	response.Write("ä")
+	response.BinaryWrite([]byte{0xC3, 0xA4})
+
+	want := []byte{0xE4, 0xC3, 0xA4}
+	if !bytes.Equal(output.Bytes(), want) {
+		t.Fatalf("unexpected unbuffered mixed response bytes: got %X want %X", output.Bytes(), want)
+	}
+}

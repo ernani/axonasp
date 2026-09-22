@@ -271,6 +271,12 @@ type Compiler struct {
 	// A value > 0 enables the leading-dot '.' statement and expression syntax.
 	withDepth          int
 	activeVBSConstants []VBSConstant
+	// ifBlockStack is the compile-time stack of If statements currently open (see ifBlock).
+	// The VBScript compiler is single-pass and cannot rewrite emitted bytecode, so the form
+	// of an If ("If c Then <stmt>" versus a block head) is only decided while it is walked:
+	// a branch keyword discovered after the inline branch promotes a single-line If to a
+	// block-capable one. The stack keeps that decision per nesting level.
+	ifBlockStack []ifBlock
 	// userGlobalsStart is the index of the first user-declared global variable slot.
 	// Slots below this index are read-only pre-injected intrinsics, built-ins, or VBScript constants.
 	// Only global slots at or above this index are eligible for ByRef argument write-back.

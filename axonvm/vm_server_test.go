@@ -1111,9 +1111,17 @@ func TestVMServerFSODrivesAndSpecialFolders(t *testing.T) {
 		t.Fatalf("expected Drives.Count > 0, got %#v", count)
 	}
 
+	// GetSpecialFolder returns a Folder object, so the path is read through .Path.
 	tempFolder := vm.dispatchNativeCall(fso.Num, "GetSpecialFolder", []Value{NewInteger(2)})
-	if tempFolder.Type != VTString || strings.TrimSpace(tempFolder.Str) == "" {
-		t.Fatalf("expected temp folder path, got %#v", tempFolder)
+	if tempFolder.Type != VTNativeObject {
+		t.Fatalf("expected GetSpecialFolder(2) to return a Folder object, got %#v", tempFolder)
+	}
+	tempPath := vm.dispatchMemberGet(tempFolder, "Path")
+	if tempPath.Type != VTString || strings.TrimSpace(tempPath.Str) == "" {
+		t.Fatalf("expected temp folder path, got %#v", tempPath)
+	}
+	if !strings.EqualFold(filepath.Clean(tempPath.Str), filepath.Clean(os.TempDir())) {
+		t.Fatalf("expected temp folder path %q, got %q", os.TempDir(), tempPath.Str)
 	}
 }
 
@@ -1189,9 +1197,10 @@ func TestVMServerFSONamePropertySetRenames(t *testing.T) {
 	}
 }
 
-// TestVMServerFSOMoveFolderReplacesExistingDestination verifies MoveFolder does
-// not leave the source folder behind when the destination path already exists.
-func TestVMServerFSOMoveFolderReplacesExistingDestination(t *testing.T) {
+// TestVMServerFSOMoveFolderIntoExistingDestination verifies MoveFolder follows the
+// Windows shell semantics: when the destination is an existing folder, the source
+// folder is moved inside it instead of replacing it, and the source is not left behind.
+func TestVMServerFSOMoveFolderIntoExistingDestination(t *testing.T) {
 	vm := NewVM(nil, nil, 5)
 	host := NewMockHost()
 	rootDir := t.TempDir()
@@ -1216,8 +1225,16 @@ func TestVMServerFSOMoveFolderReplacesExistingDestination(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rootDir, "source")); !os.IsNotExist(err) {
 		t.Fatalf("expected source folder to be removed after move, stat err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(rootDir, "dest", "keep.txt")); err != nil {
-		t.Fatalf("expected moved file at destination, got %v", err)
+	movedFile := filepath.Join(rootDir, "dest", "source", "keep.txt")
+	raw, err := os.ReadFile(movedFile)
+	if err != nil {
+		t.Fatalf("expected moved file at %q, got %v", movedFile, err)
+	}
+	if string(raw) != "source" {
+		t.Fatalf("unexpected moved file content: %q", string(raw))
+	}
+	if _, err := os.Stat(filepath.Join(rootDir, "dest", "stale.txt")); err != nil {
+		t.Fatalf("expected pre-existing destination file to survive the move, got %v", err)
 	}
 }
 

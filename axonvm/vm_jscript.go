@@ -110,10 +110,28 @@ type jsArgumentsBinding struct {
 }
 
 type jsRegExpObject struct {
-	pattern   string
-	flags     string
-	compiled  *regexp2.Regexp
-	lastIndex int
+	compiled *regexp2.Regexp
+}
+
+type jsRegExpCacheKey struct {
+	pattern string
+	flags   string
+}
+
+type jsRegExpCacheEntry struct {
+	compiled *regexp2.Regexp
+	err      error
+}
+
+const jsRegExpProgramCacheLimit = 1024
+const jsObjectShapePropertyLimit = 256
+const jsObjectShapeCacheLimit = 4096
+const jsEnvBindingsPoolLimit = 128
+const jsEnvBindingsPoolMaxEntries = 32
+
+type jsShapeTransition struct {
+	shapeID uint32
+	name    string
 }
 
 type jsDefinePropertySpec struct {
@@ -153,6 +171,23 @@ type jsFunctionObject struct {
 	capturedBlockScopeConst []map[string]struct{}
 	capturedBlockScopeTDZ   []map[string]struct{}
 	hiddenWeakData          map[uint64]Value
+}
+
+// jsFunctionTemplateMetadata is the immutable, decoded form of metadata stored
+// in a VTJSFunctionTemplate constant. It is cached per pooled VM so repeated
+// requests do not reparse integers or base64-decode names and source text.
+type jsFunctionTemplateMetadata struct {
+	params             []string
+	restParam          string
+	source             string
+	localCount         int
+	localNames         []string
+	isClassConstructor bool
+	isStrict           bool
+	isDerived          bool
+	isGenerator        bool
+	isAsync            bool
+	usesArguments      bool
 }
 
 type jsCallFrame struct {
@@ -283,7 +318,7 @@ func (vm *VM) jsImportModule(specifier string) (*jsEnvFrame, bool) {
 	vm.ensureJSRootEnv()
 	rootEnvID := vm.jsActiveEnvID
 
-	moduleEnvID := vm.allocJSID()
+	moduleEnvID := vm.allocJSEnvID()
 	moduleEnv := &jsEnvFrame{parentID: rootEnvID, bindings: make(map[string]Value, 16)}
 	vm.jsEnvItems[moduleEnvID] = moduleEnv
 	vm.jsModuleInstances[modulePath] = moduleEnv
@@ -1236,57 +1271,102 @@ func (vm *VM) jsSetProto(target Value, proto Value) {
 func (vm *VM) jsInvalidateObjectIC(objID int64) {
 	delete(vm.jsObjectShape, objID)
 	delete(vm.jsObjectSlots, objID)
-	delete(vm.jsObjectSlotIndex, objID)
+}
+
+func (vm *VM) jsTransitionObjectShape(objID int64, key string, value Value) bool {
+	if _, disabled := vm.jsObjectShapeDisabled[objID]; disabled {
+		return false
+	}
+	oldShape, tracked := vm.jsObjectShape[objID]
+	if !tracked || strings.HasPrefix(key, jsInternalPropPrefix) {
+		return false
+	}
+	if len(vm.jsShapeSlots[oldShape]) >= jsObjectShapePropertyLimit {
+		vm.jsInvalidateObjectIC(objID)
+		vm.jsObjectShapeDisabled[objID] = struct{}{}
+		return false
+	}
+	if slot, exists := vm.jsShapeSlotIndex[oldShape][key]; exists {
+		slots := vm.jsObjectSlots[objID]
+		if int(slot) < len(slots) {
+			slots[slot] = value
+			return true
+		}
+		vm.jsInvalidateObjectIC(objID)
+		return false
+	}
+
+	transition := jsShapeTransition{shapeID: oldShape, name: key}
+	newShape := vm.jsShapeTransitions[transition]
+	if newShape == 0 {
+		if vm.jsShapeCacheSaturated || len(vm.jsShapeTransitions) >= jsObjectShapeCacheLimit {
+			vm.jsShapeCacheSaturated = true
+			vm.jsInvalidateObjectIC(objID)
+			vm.jsObjectShapeDisabled[objID] = struct{}{}
+			return false
+		}
+		newShape = vm.jsNextShapeID
+		if newShape == 0 {
+			newShape = 1
+		}
+		vm.jsNextShapeID = newShape + 1
+
+		oldNames := vm.jsShapeSlots[oldShape]
+		names := make([]string, len(oldNames)+1)
+		copy(names, oldNames)
+		names[len(oldNames)] = key
+		index := make(map[string]uint16, len(names))
+		for i, name := range names {
+			index[name] = uint16(i)
+		}
+		vm.jsShapeSlots[newShape] = names
+		vm.jsShapeSlotIndex[newShape] = index
+		vm.jsShapeTransitions[transition] = newShape
+	}
+
+	vm.jsObjectShape[objID] = newShape
+	vm.jsObjectSlots[objID] = append(vm.jsObjectSlots[objID], value)
+	return true
 }
 
 func (vm *VM) jsEnsureObjectICLayout(objID int64) bool {
+	if _, disabled := vm.jsObjectShapeDisabled[objID]; disabled {
+		return false
+	}
 	obj, ok := vm.jsObjectItems[objID]
 	if !ok {
 		return false
 	}
-	keys := make([]string, 0, len(obj))
+	if _, tracked := vm.jsObjectShape[objID]; tracked {
+		return true
+	}
+
+	vm.jsObjectShape[objID] = 0
+	vm.jsObjectSlots[objID] = make([]Value, 0, len(obj))
+	seen := make(map[string]struct{}, len(obj))
+	for _, key := range vm.jsObjectKeyOrder[objID] {
+		value, exists := obj[key]
+		if !exists || strings.HasPrefix(key, jsInternalPropPrefix) {
+			continue
+		}
+		vm.jsTransitionObjectShape(objID, key, value)
+		seen[key] = struct{}{}
+	}
+	fallbackKeys := make([]string, 0, len(obj)-len(seen))
 	for key := range obj {
 		if strings.HasPrefix(key, jsInternalPropPrefix) {
 			continue
 		}
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	var shapeSig strings.Builder
-	for i := 0; i < len(keys); i++ {
-		if i > 0 {
-			shapeSig.WriteByte('\x1f')
+		if _, exists := seen[key]; exists {
+			continue
 		}
-		shapeSig.WriteString(keys[i])
+		fallbackKeys = append(fallbackKeys, key)
 	}
-
-	shapeID := vm.jsShapeBySignature[shapeSig.String()]
-	if shapeID == 0 {
-		shapeID = vm.jsNextShapeID
-		if shapeID == 0 {
-			shapeID = 1
-		}
-		vm.jsNextShapeID = shapeID + 1
-		vm.jsShapeBySignature[shapeSig.String()] = shapeID
-		if len(keys) > 0 {
-			layout := make([]string, len(keys))
-			copy(layout, keys)
-			vm.jsShapeSlots[shapeID] = layout
-		}
+	sort.Strings(fallbackKeys)
+	for _, key := range fallbackKeys {
+		value := obj[key]
+		vm.jsTransitionObjectShape(objID, key, value)
 	}
-
-	slots := make([]Value, len(keys))
-	indexByName := make(map[string]uint16, len(keys))
-	for i := 0; i < len(keys); i++ {
-		k := keys[i]
-		slots[i] = obj[k]
-		indexByName[k] = uint16(i)
-	}
-
-	vm.jsObjectShape[objID] = shapeID
-	vm.jsObjectSlots[objID] = slots
-	vm.jsObjectSlotIndex[objID] = indexByName
 	return true
 }
 
@@ -1301,7 +1381,7 @@ func (vm *VM) jsResolveICSlot(target Value, member string) (uint32, uint16, bool
 	if shapeID == 0 {
 		return 0, 0, false
 	}
-	slot, ok := vm.jsObjectSlotIndex[target.Num][member]
+	slot, ok := vm.jsShapeSlotIndex[shapeID][member]
 	if !ok {
 		return 0, 0, false
 	}
@@ -1366,10 +1446,14 @@ func (vm *VM) jsICMemberSet(target Value, member string, val Value, shapeID uint
 	}
 	slots[slot] = val
 	vm.jsObjectSlots[target.Num] = slots
-	if hasDesc {
+	if props := vm.jsPropertyItems[target.Num]; props != nil {
+		desc, hasExplicitDesc := props[member]
+		if !hasExplicitDesc {
+			return true
+		}
 		desc.Value = val
 		desc.HasValue = true
-		vm.jsPropertyItems[target.Num][member] = desc
+		props[member] = desc
 	}
 	return true
 }
@@ -1526,21 +1610,38 @@ func (vm *VM) jsGetDescriptor(objID int64, key string) (jsPropertyDescriptor, bo
 }
 
 func (vm *VM) jsSetDescriptor(objID int64, key string, desc jsPropertyDescriptor) {
-	props := vm.jsEnsurePropertyMap(objID)
-	_, exists := props[key]
-	props[key] = desc
-	if !exists {
+	obj := vm.jsObjectItems[objID]
+	props := vm.jsPropertyItems[objID]
+	_, descriptorExists := props[key]
+	_, propertyTracked := vm.jsObjectKeySet[objID][key]
+	propertyExists := propertyTracked || descriptorExists
+	defaultData := desc.HasValue && !desc.HasGetter && !desc.HasSetter && desc.Enumerable && desc.Configurable && desc.Writable
+
+	if defaultData {
+		if descriptorExists {
+			delete(props, key)
+		}
+	} else {
+		props = vm.jsEnsurePropertyMap(objID)
+		props[key] = desc
+	}
+	if !propertyExists {
 		vm.jsTrackObjectKey(objID, key)
 	}
 	if desc.HasValue {
-		obj, ok := vm.jsObjectItems[objID]
-		if !ok {
+		if obj == nil {
 			obj = make(map[string]Value, 8)
 			vm.jsObjectItems[objID] = obj
 		}
 		obj[key] = desc.Value
+		if defaultData {
+			vm.jsTransitionObjectShape(objID, key, desc.Value)
+		} else {
+			vm.jsInvalidateObjectIC(objID)
+		}
+	} else {
+		vm.jsInvalidateObjectIC(objID)
 	}
-	vm.jsInvalidateObjectIC(objID)
 }
 
 func (vm *VM) jsCreatePrototypeObject(owner Value) Value {
@@ -2348,6 +2449,15 @@ func (vm *VM) allocJSID() int64 {
 		vm.jsObjectKeyOrder = make(map[int64][]string)
 	}
 	vm.jsObjectKeyOrder[id] = make([]string, 0, 8)
+	return id
+}
+
+// allocJSEnvID reserves an ID for a lexical environment without allocating
+// object-property tracking state. Environment IDs share the dynamic ID space
+// with objects but are never exposed as JavaScript values.
+func (vm *VM) allocJSEnvID() int64 {
+	id := vm.nextDynamicNativeID
+	vm.nextDynamicNativeID++
 	return id
 }
 
@@ -3331,29 +3441,28 @@ func (vm *VM) jsChargeStringWork(size int) bool {
 	return false
 }
 
-func (vm *VM) jsCreateClosure(template Value) Value {
-	if template.Type != VTJSFunctionTemplate && template.Type != VTJSArrowFunctionTemplate {
-		return Value{Type: VTJSUndefined}
+func (vm *VM) jsFunctionTemplateMetadata(templateIdx uint16, template Value) *jsFunctionTemplateMetadata {
+	index := int(templateIdx)
+	if len(vm.jsFunctionTemplateMetadataCache) < len(vm.constants) {
+		vm.jsFunctionTemplateMetadataCache = append(
+			vm.jsFunctionTemplateMetadataCache,
+			make([]*jsFunctionTemplateMetadata, len(vm.constants)-len(vm.jsFunctionTemplateMetadataCache))...,
+		)
 	}
-	id := vm.allocJSID()
-	fnVal := Value{Type: VTJSFunction, Num: id}
-	proto := vm.jsCreatePrototypeObject(fnVal)
-	params := make([]string, 0, len(template.Names))
-	restParam := ""
-	source := ""
-	localCount := 0
-	isClassConstructor := false
-	isStrict := false
-	isDerived := false
-	isGenerator := false
-	isAsync := false
-	usesArguments := false
-	var localNames []string
+	if index < len(vm.jsFunctionTemplateMetadataCache) {
+		if cached := vm.jsFunctionTemplateMetadataCache[index]; cached != nil {
+			return cached
+		}
+	}
+
+	metadata := &jsFunctionTemplateMetadata{
+		params: make([]string, 0, len(template.Names)),
+	}
 	for i := 0; i < len(template.Names); i++ {
 		name := template.Names[i]
 		if after, ok := strings.CutPrefix(name, "__js_local_count__:"); ok {
 			if n, err := strconv.Atoi(after); err == nil && n > 0 {
-				localCount = n
+				metadata.localCount = n
 			}
 			continue
 		}
@@ -3363,67 +3472,76 @@ func (vm *VM) jsCreateClosure(template Value) Value {
 				slot, slotErr := strconv.Atoi(parts[0])
 				decoded, decodeErr := base64.StdEncoding.DecodeString(parts[1])
 				if slotErr == nil && decodeErr == nil && slot >= 0 {
-					if len(localNames) <= slot {
-						localNames = append(localNames, make([]string, slot-len(localNames)+1)...)
+					if len(metadata.localNames) <= slot {
+						metadata.localNames = append(metadata.localNames, make([]string, slot-len(metadata.localNames)+1)...)
 					}
-					localNames[slot] = string(decoded)
+					metadata.localNames[slot] = string(decoded)
 				}
 			}
 			continue
 		}
 		if after, ok := strings.CutPrefix(name, jsRestParamPrefix); ok {
-			restParam = after
+			metadata.restParam = after
 			continue
 		}
 		if after, ok := strings.CutPrefix(name, jsFunctionSourceMetaPrefix); ok {
 			if decoded, err := base64.StdEncoding.DecodeString(after); err == nil {
-				source = string(decoded)
+				metadata.source = string(decoded)
 			}
 			continue
 		}
-		if name == jsClassConstructorFlag {
-			isClassConstructor = true
-			continue
+		switch name {
+		case jsClassConstructorFlag:
+			metadata.isClassConstructor = true
+		case jsStrictModeFlag:
+			metadata.isStrict = true
+		case jsGeneratorFlag:
+			metadata.isGenerator = true
+		case jsAsyncFlag:
+			metadata.isAsync = true
+		case jsDerivedConstructorFlag:
+			metadata.isDerived = true
+		case jsUsesArgumentsFlag:
+			metadata.usesArguments = true
+		default:
+			metadata.params = append(metadata.params, name)
 		}
-		if name == jsStrictModeFlag {
-			isStrict = true
-			continue
-		}
-		if name == jsGeneratorFlag {
-			isGenerator = true
-			continue
-		}
-		if name == jsAsyncFlag {
-			isAsync = true
-			continue
-		}
-		if name == jsDerivedConstructorFlag {
-			isDerived = true
-			continue
-		}
-		if name == jsUsesArgumentsFlag {
-			usesArguments = true
-			continue
-		}
-		params = append(params, name)
 	}
+	if index < len(vm.jsFunctionTemplateMetadataCache) {
+		vm.jsFunctionTemplateMetadataCache[index] = metadata
+	}
+	return metadata
+}
+
+func (vm *VM) jsCreateClosure(templateIdx uint16) Value {
+	if int(templateIdx) >= len(vm.constants) {
+		return Value{Type: VTJSUndefined}
+	}
+	template := vm.constants[templateIdx]
+	if template.Type != VTJSFunctionTemplate && template.Type != VTJSArrowFunctionTemplate {
+		return Value{Type: VTJSUndefined}
+	}
+	id := vm.allocJSID()
+	fnVal := Value{Type: VTJSFunction, Num: id}
+	proto := vm.jsCreatePrototypeObject(fnVal)
+	metadata := vm.jsFunctionTemplateMetadata(templateIdx, template)
 	fnObj := &jsFunctionObject{
 		name:               template.Str,
-		source:             source,
-		params:             params,
-		restParam:          restParam,
-		localCount:         localCount,
-		localNames:         localNames,
+		source:             metadata.source,
+		params:             metadata.params,
+		restParam:          metadata.restParam,
+		localCount:         metadata.localCount,
+		localNames:         metadata.localNames,
 		startIP:            int(template.Num),
 		endIP:              int(template.Flt),
 		envID:              vm.jsActiveEnvID,
 		protoID:            proto.Num,
-		isClassConstructor: isClassConstructor,
-		isStrict:           isStrict,
-		isDerived:          isDerived,
-		isAsync:            isAsync,
-		isGenerator:        isGenerator,
-		usesArguments:      usesArguments,
+		isClassConstructor: metadata.isClassConstructor,
+		isStrict:           metadata.isStrict,
+		isDerived:          metadata.isDerived,
+		isAsync:            metadata.isAsync,
+		isGenerator:        metadata.isGenerator,
+		usesArguments:      metadata.usesArguments,
 	}
 	if vm.jsBlockScopeDepth > 0 {
 		activeDepth := min(min(min(vm.jsBlockScopeDepth, len(vm.jsBlockScopes)), len(vm.jsBlockScopeConst)), len(vm.jsBlockScopeTDZ))
@@ -3524,8 +3642,8 @@ func (vm *VM) jsBeginFunctionCall(fn Value, thisVal Value, args []Value, ctorObj
 	vm.jsBlockScopeConst = append(make([]map[string]struct{}, 0, len(closure.capturedBlockScopeConst)), closure.capturedBlockScopeConst...)
 	vm.jsBlockScopeTDZ = append(make([]map[string]struct{}, 0, len(closure.capturedBlockScopeTDZ)), closure.capturedBlockScopeTDZ...)
 	vm.jsBlockScopeDepth = len(vm.jsBlockScopes)
-	envID := vm.allocJSID()
-	bindings := make(map[string]Value, len(closure.params)+2)
+	envID := vm.allocJSEnvID()
+	bindings := vm.jsAcquireEnvBindings(len(closure.params) + 2)
 	for i := 0; i < len(closure.params); i++ {
 		if i < len(args) {
 			bindings[closure.params[i]] = args[i]
@@ -3693,6 +3811,18 @@ func (vm *VM) jsEnvHasCapturedClosures(envID int64) bool {
 	return env != nil && env.capturedClosures > 0
 }
 
+func (vm *VM) jsAcquireEnvBindings(capacity int) map[string]Value {
+	if capacity <= jsEnvBindingsPoolMaxEntries {
+		if count := len(vm.jsEnvBindingsPool); count > 0 {
+			bindings := vm.jsEnvBindingsPool[count-1]
+			vm.jsEnvBindingsPool[count-1] = nil
+			vm.jsEnvBindingsPool = vm.jsEnvBindingsPool[:count-1]
+			return bindings
+		}
+	}
+	return make(map[string]Value, capacity)
+}
+
 // jsReleaseEnvFrame drops one non-captured JScript env frame and its transient arguments object.
 func (vm *VM) jsReleaseEnvFrame(envID int64) {
 	if envID == 0 || envID == vm.jsRootEnvID {
@@ -3706,6 +3836,7 @@ func (vm *VM) jsReleaseEnvFrame(envID int64) {
 		return
 	}
 	if env != nil && env.bindings != nil {
+		bindingCount := len(env.bindings)
 		if argsObj, hasArgs := env.bindings["arguments"]; hasArgs && argsObj.Type == VTJSObject {
 			delete(vm.jsArgumentsItems, argsObj.Num)
 			delete(vm.jsObjectItems, argsObj.Num)
@@ -3713,6 +3844,9 @@ func (vm *VM) jsReleaseEnvFrame(envID int64) {
 			delete(vm.jsObjectStateItems, argsObj.Num)
 		}
 		clear(env.bindings)
+		if bindingCount <= jsEnvBindingsPoolMaxEntries && len(vm.jsEnvBindingsPool) < jsEnvBindingsPoolLimit {
+			vm.jsEnvBindingsPool = append(vm.jsEnvBindingsPool, env.bindings)
+		}
 	}
 	env.argumentsObjID = 0
 	delete(vm.jsEnvItems, envID)
@@ -3807,8 +3941,8 @@ func (vm *VM) jsTailCallValue(callee Value, thisVal Value, args []Value) bool {
 	}
 	if !canReuseEnv {
 		vm.jsReleaseEnvFrame(vm.jsActiveEnvID)
-		envID = vm.allocJSID()
-		bindings = make(map[string]Value, len(closure.params)+2)
+		envID = vm.allocJSEnvID()
+		bindings = vm.jsAcquireEnvBindings(len(closure.params) + 2)
 		vm.jsEnvItems[envID] = &jsEnvFrame{parentID: closure.envID, bindings: bindings}
 	}
 
@@ -8607,7 +8741,7 @@ func (vm *VM) jsStringReplaceRegex(source string, pattern string, flags string, 
 	if !useCallback {
 		replacement = vm.jsToString(replacementArg)
 	}
-	flagsLower := strings.ToLower(flags)
+	flagsLower := jsASCIILowerRegExpFlags(flags)
 	useAll := replaceAll || strings.Contains(flagsLower, "g")
 
 	var b strings.Builder
@@ -10731,6 +10865,14 @@ func (vm *VM) jsToString(v Value) string {
 	if v.Type == VTArgRef {
 		v = vm.stack[int(v.Num)]
 	}
+	if v.Type == VTNativeObject {
+		if collectionValue, exists := vm.requestCollectionValueItems[v.Num]; exists {
+			if len(collectionValue.Values) == 0 {
+				return "undefined"
+			}
+			return collectionValue.Joined()
+		}
+	}
 	// ADODB Field proxies expose their Value property as the default member.
 	// Resolve it before JScript coercion so SQL NULL follows String(null) and
 	// becomes lowercase "null", rather than the VB-style "Null" text.
@@ -10744,6 +10886,11 @@ func (vm *VM) jsToString(v Value) string {
 		return "undefined"
 	case VTNull:
 		return "null"
+	case VTDate:
+		if result, handled := vm.jsCallDateMethod(v, "toString", nil); handled {
+			return result.Str
+		}
+		return vm.valueToString(v)
 	case VTBool:
 		if v.Num != 0 {
 			return "true"
@@ -11803,6 +11950,7 @@ func (vm *VM) jsMemberDelete(obj Value, member string) bool {
 				delete(props, member)
 			}
 			vm.jsUntrackObjectKey(obj.Num, member)
+			vm.jsInvalidateObjectIC(obj.Num)
 			return true
 		}
 	}
@@ -12031,9 +12179,9 @@ func jsTranslateUnicodePropertyEscapes(pattern string) string {
 }
 
 func (vm *VM) jsCompileRegExp(pattern string, flags string) (*regexp2.Regexp, error) {
+	flagsLower := jsASCIILowerRegExpFlags(flags)
 	var options regexp2.RegexOptions
 
-	flagsLower := strings.ToLower(flags)
 	if strings.Contains(flagsLower, "i") {
 		options |= regexp2.IgnoreCase
 	}
@@ -12045,13 +12193,54 @@ func (vm *VM) jsCompileRegExp(pattern string, flags string) (*regexp2.Regexp, er
 	}
 	if strings.Contains(flagsLower, "u") {
 		options |= regexp2.Unicode
+	}
+	cacheKey := jsRegExpCacheKey{pattern: pattern, flags: jsCanonicalRegExpCacheFlags(flagsLower)}
+	if cached, ok := vm.jsRegExpProgramCache[cacheKey]; ok {
+		return cached.compiled, cached.err
+	}
+	compilePattern := pattern
+	if strings.Contains(flagsLower, "u") {
 		// Translate JS \u{...} to regexp2 \x{...}
-		pattern = jsRegExpUnicodeEscapeRegex.ReplaceAllString(pattern, `\x{$1}`)
+		compilePattern = jsRegExpUnicodeEscapeRegex.ReplaceAllString(compilePattern, `\x{$1}`)
 		// Normalize JS Unicode property aliases to regex category shorthands.
-		pattern = jsTranslateUnicodePropertyEscapes(pattern)
+		compilePattern = jsTranslateUnicodePropertyEscapes(compilePattern)
 	}
 
-	return regexp2.Compile(pattern, options)
+	compiled, err := regexp2.Compile(compilePattern, options)
+	if vm.jsRegExpProgramCache == nil {
+		vm.jsRegExpProgramCache = make(map[jsRegExpCacheKey]jsRegExpCacheEntry)
+	}
+	if len(vm.jsRegExpProgramCache) < jsRegExpProgramCacheLimit {
+		vm.jsRegExpProgramCache[cacheKey] = jsRegExpCacheEntry{compiled: compiled, err: err}
+	}
+	return compiled, err
+}
+
+func jsCanonicalRegExpCacheFlags(flags string) string {
+	var canonical [6]byte
+	count := 0
+	for _, flag := range []byte{'g', 'i', 'm', 's', 'u', 'y'} {
+		if strings.ContainsRune(flags, rune(flag)) {
+			canonical[count] = flag
+			count++
+		}
+	}
+	return string(canonical[:count])
+}
+
+func jsASCIILowerRegExpFlags(flags string) string {
+	for i := 0; i < len(flags); i++ {
+		if flags[i] >= 'A' && flags[i] <= 'Z' {
+			lower := []byte(flags)
+			for j := i; j < len(lower); j++ {
+				if lower[j] >= 'A' && lower[j] <= 'Z' {
+					lower[j] += 'a' - 'A'
+				}
+			}
+			return string(lower)
+		}
+	}
+	return flags
 }
 
 func (vm *VM) jsGetCompiledRegExp(objID int64) (*regexp2.Regexp, error) {
@@ -12068,8 +12257,6 @@ func (vm *VM) jsGetCompiledRegExp(objID int64) (*regexp2.Regexp, error) {
 	}
 
 	vm.jsRegExpItems[objID] = &jsRegExpObject{
-		pattern:  pattern,
-		flags:    flags,
 		compiled: re,
 	}
 	return re, nil

@@ -107,6 +107,12 @@ func (c *Compiler) parseStatement() {
 		return
 	case *vbscript.KeywordToken:
 		switch t.Keyword {
+		case vbscript.KeywordEnd:
+			// No open construct claimed this block terminator, so it is orphaned. The
+			// common case is an End If that follows a single-line If which already
+			// completed at its branch body: "<% If c Then s %>" plus "<% End If %>".
+			// Microsoft VBScript reports the same condition as a missing End.
+			panic(c.vbCompileError(vbscript.ExpectedEnd, fmt.Sprintf("Expected keyword %v", vbscript.KeywordEnd)))
 		case vbscript.KeywordOption:
 			c.move() // Consume 'Option'
 			c.parseOptionStatementAfterOptionKeyword()
@@ -3182,72 +3188,92 @@ func (c *Compiler) consumeTagBoundaryKeyword(targetKw vbscript.Keyword, secondKw
 	return true
 }
 
+// ifBlock records the syntactic form of one If statement while the single-pass compiler
+// walks it. The form is not known when the statement starts: "If c Then <stmt>" is a
+// complete single-line If, but the very same tokens are also the head of a block-capable
+// If once an ElseIf/Else branch follows. The form decides whether an "End If" can still
+// belong to the statement after an ASP tag boundary terminated a branch body, so it is
+// tracked as explicit compiler state instead of being re-derived from token text.
+type ifBlock uint8
+
+const (
+	// ifSingleLineIf is "If c Then <stmt>": complete at the end of its branch body
+	// (colon, logical line end, or ASP tag boundary). No "End If" belongs to it.
+	ifSingleLineIf ifBlock = iota
+
+	// ifBranchChain is "If c Then <stmt> [ElseIf c Then <stmt>] [Else c <stmt>]".
+	// VBScript has no single-line ElseIf, and an Else placed after an inline branch makes
+	// the statement a branch chain, so a branch keyword proves the If is a block head:
+	// the block stays open across ASP tag boundaries and "End If" is its legal closer.
+	ifBranchChain
+
+	// ifBlockIf is "If c Then" followed by a logical line end: the explicit block form,
+	// where every branch body is a statement list and "End If" is mandatory.
+	ifBlockIf
+)
+
+// pushIfBlock opens an If frame on the compile-time block stack.
+func (c *Compiler) pushIfBlock(form ifBlock) {
+	c.ifBlockStack = append(c.ifBlockStack, form)
+}
+
+// popIfBlock closes the innermost If frame.
+func (c *Compiler) popIfBlock() {
+	if last := len(c.ifBlockStack) - 1; last >= 0 {
+		c.ifBlockStack = c.ifBlockStack[:last]
+	}
+}
+
+// promoteInlineIfToBranchChain records that the innermost If is block-capable because a
+// branch keyword followed its inline branch body.
+func (c *Compiler) promoteInlineIfToBranchChain() {
+	if last := len(c.ifBlockStack) - 1; last >= 0 && c.ifBlockStack[last] == ifSingleLineIf {
+		c.ifBlockStack[last] = ifBranchChain
+	}
+}
+
+// isEndIfAhead reports whether the statement stream is positioned on "End If" without
+// consuming anything, so a closer is only taken when it really is the End If of the If
+// and never the "End" of "End Sub", "End Function" or "End With".
+func (c *Compiler) isEndIfAhead() bool {
+	if !c.checkKeyword(vbscript.KeywordEnd) || c.lexer == nil {
+		return false
+	}
+	lCopy := *c.lexer
+	return c.tokenMatchesKeywordOrIdentifier(lCopy.NextToken(), vbscript.KeywordIf, strings.ToLower(vbscript.KeywordIf.String()))
+}
+
+// parseIfStatement compiles every If form accepted by Microsoft VBScript. What follows
+// Then selects the form, which is recorded on the If block stack:
+//
+//	block form:       "If c Then" <logical line end> ... "End If"    (End If mandatory)
+//	single-line form: "If c Then <stmt>"                            (self-contained)
+//	branch chain:     "If c Then <stmt> ElseIf c Then <stmt> ..."   (block stays open)
+//
+// The distinction decides how an ASP tag boundary is treated: a single-line If is already
+// complete when "%>" terminates its branch body, so a later "End If" is an orphan, while a
+// branch chain is still an open block and that same "End If" is its legal closer.
 func (c *Compiler) parseIfStatement() {
 	c.expectKeyword(vbscript.KeywordIf)
 	c.parseExpression(PrecNone)
 	c.expectKeyword(vbscript.KeywordThen)
-	jumpEndOffsets := make([]int, 0, 2)
 
-	if !c.isLineEndAfterThen() {
-		jumpFalseOffset := c.emitJump(OpJumpIfFalse)
-		c.parseInlineIfBranchStatements()
-
-		for c.checkKeyword(vbscript.KeywordElseIf) || c.consumeTagBoundaryKeyword(vbscript.KeywordElseIf, 0) {
-			jumpEndOffsets = append(jumpEndOffsets, c.emitJump(OpJump))
-			c.patchJump(jumpFalseOffset)
-
-			c.move()
-			c.parseExpression(PrecNone)
-			c.expectKeyword(vbscript.KeywordThen)
-
-			jumpFalseOffset = c.emitJump(OpJumpIfFalse)
-			c.parseInlineIfBranchStatements()
-		}
-
-		if c.checkKeyword(vbscript.KeywordElse) || c.consumeTagBoundaryKeyword(vbscript.KeywordElse, 0) {
-			c.move()
-			jumpEndOffsets = append(jumpEndOffsets, c.emitJump(OpJump))
-			c.patchJump(jumpFalseOffset)
-			c.parseInlineIfBranchStatements()
-		} else {
-			c.patchJump(jumpFalseOffset)
-		}
-
-		for _, jumpEndOffset := range jumpEndOffsets {
-			c.patchJump(jumpEndOffset)
-		}
-
-		// Microsoft VBScript compatibility: in single-line If forms, an explicit
-		// trailing "End If" is accepted on the same logical line (e.g. "If x Then y=1 : End If")
-		// or across an ASP tag boundary (e.g. "If x Then y=1 %><% End If").
-		// Line terminators are NOT consumed here — consuming them would incorrectly
-		// eat the "End" from "End Function", "End Sub", etc. on the following line.
-		for {
-			switch c.next.(type) {
-			case *vbscript.ColonLineTerminationToken, *vbscript.CommentToken:
-				c.move()
-				continue
-			}
-			break
-		}
-		c.consumeTagBoundaryKeyword(vbscript.KeywordEnd, vbscript.KeywordIf)
-		for {
-			switch c.next.(type) {
-			case *vbscript.ColonLineTerminationToken, *vbscript.CommentToken:
-				c.move()
-				continue
-			}
-			break
-		}
-		if c.checkKeyword(vbscript.KeywordEnd) {
-			c.move()
-			if c.checkKeyword(vbscript.KeywordIf) {
-				c.move()
-			}
-		}
+	if c.isLineEndAfterThen() {
+		c.parseBlockIfStatement()
 		return
 	}
+	c.parseInlineIfStatement()
+}
 
+// parseBlockIfStatement compiles "If <cond> Then" plus a logical line end, where every
+// branch body is a statement list and "End If" is mandatory. The line end after the
+// opening Then already committed the statement to block form, so the branch bodies keep
+// spanning ASP tag boundaries, including an inline branch such as "ElseIf c Then <stmt> %>".
+func (c *Compiler) parseBlockIfStatement() {
+	c.pushIfBlock(ifBlockIf)
+	defer c.popIfBlock()
+
+	jumpEndOffsets := make([]int, 0, 2)
 	jumpFalseOffset := c.emitJump(OpJumpIfFalse)
 	c.parseIfConditionalBlock()
 
@@ -3260,11 +3286,7 @@ func (c *Compiler) parseIfStatement() {
 		c.expectKeyword(vbscript.KeywordThen)
 
 		jumpFalseOffset = c.emitJump(OpJumpIfFalse)
-		if c.isLineEndAfterThen() {
-			c.parseIfConditionalBlock()
-		} else {
-			c.parseInlineIfBranchStatements()
-		}
+		c.parseIfConditionalBlock()
 	}
 
 	if c.checkKeyword(vbscript.KeywordElse) {
@@ -3281,6 +3303,83 @@ func (c *Compiler) parseIfStatement() {
 	for _, jumpEndOffset := range jumpEndOffsets {
 		c.patchJump(jumpEndOffset)
 	}
+}
+
+// parseInlineIfStatement compiles "If <cond> Then <statement>" forms. The head branch body
+// is inline: it ends at the first statement boundary, that is a colon, the logical line end
+// or an ASP tag boundary.
+//
+// A branch keyword changes the shape of the statement. VBScript has no single-line ElseIf,
+// and an Else after an inline branch turns the statement into a branch chain, so a branch
+// keyword found after the inline head proves the If is a block head. The statement is then
+// promoted on the If block stack and the remaining branch bodies are compiled as statement
+// lists that may span ASP tag boundaries, with "End If" as their closer. A plain single-line
+// If is instead complete when the tag boundary terminates its body, which is why a following
+// "End If" is left for the statement dispatcher to reject as orphaned.
+func (c *Compiler) parseInlineIfStatement() {
+	c.pushIfBlock(ifSingleLineIf)
+	defer c.popIfBlock()
+
+	jumpEndOffsets := make([]int, 0, 2)
+	jumpFalseOffset := c.emitJump(OpJumpIfFalse)
+	c.parseInlineIfBranchStatements()
+
+	for c.checkKeyword(vbscript.KeywordElseIf) || c.consumeTagBoundaryKeyword(vbscript.KeywordElseIf, 0) {
+		c.promoteInlineIfToBranchChain()
+
+		jumpEndOffsets = append(jumpEndOffsets, c.emitJump(OpJump))
+		c.patchJump(jumpFalseOffset)
+
+		c.move()
+		c.parseExpression(PrecNone)
+		c.expectKeyword(vbscript.KeywordThen)
+
+		jumpFalseOffset = c.emitJump(OpJumpIfFalse)
+		c.parseIfConditionalBlock()
+	}
+
+	if c.checkKeyword(vbscript.KeywordElse) || c.consumeTagBoundaryKeyword(vbscript.KeywordElse, 0) {
+		c.promoteInlineIfToBranchChain()
+
+		c.move()
+		jumpEndOffsets = append(jumpEndOffsets, c.emitJump(OpJump))
+		c.patchJump(jumpFalseOffset)
+		c.parseIfElseBlock()
+	} else {
+		c.patchJump(jumpFalseOffset)
+	}
+
+	for _, jumpEndOffset := range jumpEndOffsets {
+		c.patchJump(jumpEndOffset)
+	}
+
+	c.consumeInlineIfEndIf()
+}
+
+// consumeInlineIfEndIf consumes the optional "End If" that closes an inline If statement.
+// Microsoft VBScript accepts it when it is still on the same logical line, as in
+// "If c Then s : End If". It is never searched for across an ASP tag boundary here:
+// "If c Then s %>" already completed the statement, so a following "<% End If %>" is an
+// orphan. Branch chains never arrive with an unresolved closer because their branch bodies
+// are compiled as block bodies, which stop at the branch keywords and at End If, leaving
+// the closer directly in front of this check.
+// Line terminators are NOT consumed, otherwise the "End" of "End Function", "End Sub" or
+// "End With" on the following line would be eaten by the closer check.
+func (c *Compiler) consumeInlineIfEndIf() {
+	for {
+		switch c.next.(type) {
+		case *vbscript.ColonLineTerminationToken, *vbscript.CommentToken:
+			c.move()
+			continue
+		}
+		break
+	}
+
+	if !c.isEndIfAhead() {
+		return
+	}
+	c.move() // Consume 'End'
+	c.move() // Consume 'If'
 }
 
 // parseSelectCaseStatement compiles Select Case ... Case ... End Select blocks.

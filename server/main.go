@@ -63,6 +63,7 @@ var (
 	RootDir                       = "./www"
 	EnableWebConfig               = true
 	EnableDirectoryListing        = false
+	ExposeServerHeaders           = true
 	DirectoryListingTemplate      = "./www/axonasp-pages/directory-listing.html"
 	DefaultPages                  = []string{"index.asp", "default.asp", "index.html", "default.html", "default.asp"}
 	ExecuteAsASPExtensions        = []string{".asp"}
@@ -170,6 +171,7 @@ func loadServerConfig() {
 	}
 	EnableWebConfig = v.GetBool("server.enable_webconfig")
 	EnableDirectoryListing = v.GetBool("server.enable_directory_listing")
+	ExposeServerHeaders = !v.IsSet("server.expose_server_headers") || v.GetBool("server.expose_server_headers")
 	if templatePath := strings.TrimSpace(v.GetString("server.directory_listing_template")); templatePath != "" {
 		DirectoryListingTemplate = templatePath
 	}
@@ -429,7 +431,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:    ":" + Port,
-		Handler: withServerHeader(mux),
+		Handler: withServerHeaders(mux, ExposeServerHeaders),
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -467,11 +469,13 @@ func main() {
 	fmt.Println("Server exited gracefully.")
 }
 
-// withServerHeader ensures every HTTP response advertises the AxonASP server header.
-func withServerHeader(next http.Handler) http.Handler {
+// withServerHeaders conditionally identifies AxonASP in HTTP responses.
+func withServerHeaders(next http.Handler, expose bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Server", "AxonASP")
-		w.Header().Set("X-Powered-By", "AxonASP")
+		if expose {
+			w.Header().Set("Server", "AxonASP")
+			w.Header().Set("X-Powered-By", "AxonASP")
+		}
 		next.ServeHTTP(w, r)
 	})
 }

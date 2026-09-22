@@ -31,8 +31,8 @@ import (
 func TestServerEncoding(t *testing.T) {
 	server := NewServer()
 
-	htmlEncoded := server.HTMLEncode("<b>&\"</b>")
-	if htmlEncoded != "&lt;b&gt;&amp;&#34;&lt;/b&gt;" {
+	htmlEncoded := server.HTMLEncode("<b>&\"ä😀</b>")
+	if htmlEncoded != "&lt;b&gt;&amp;&#34;&#228;&#128512;&lt;/b&gt;" {
 		t.Fatalf("unexpected HTMLEncode output: %s", htmlEncoded)
 	}
 

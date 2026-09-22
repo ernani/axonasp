@@ -119,6 +119,11 @@ engine_mode = "default"
 
 #Web server configuration for AxonASP Server. This section contains settings related to the web server functionality (axonasp-http), such as the directory for error pages, the web root directory, default pages to serve, the port to listen on, and blocked file extensions. These settings help configure how the server handles incoming HTTP requests and serves content to clients. Adjust these settings according to your specific needs and server environment. This is where you can customize the behavior of the web server to ensure it serves your ASP applications correctly and securely througt the Proxy module, which is the default way to use AxonASP Server, but you can also use the FastCGI module if you prefer, which will allow you to use AxonASP Server with other web servers like Nginx or Apache, but it requires a bit more configuration and is not as straightforward as using the built-in web server, so we recommend using the built-in web server for most users, especially if you are new to web servers and ASP development.
 [server]
+# When true, HTTP and FastCGI responses identify AxonASP through Server and
+# X-Powered-By headers. Disable this when the deployment should suppress
+# implementation-identifying response headers.
+expose_server_headers = true
+
 # The directory where the server will look for default error pages. When an error occurs (e.g., 404 Not Found, 500 Internal Server Error), the server will check this directory for corresponding error page files (e.g., 404.html, 500.asp) and serve them to the client. If no custom error page is found, the server will return a default error message. You can customize this directory and the error pages to provide a better user experience when errors occur on your website. This configuration may be overridden by settings in the web.config file of your ASP application, allowing you to specify different error pages for different applications or directories.
 default_error_pages_directory = "./www/error-pages"
 

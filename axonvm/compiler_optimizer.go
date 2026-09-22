@@ -260,17 +260,44 @@ func getFusedBranchOp(op OpCode, jumpOp OpCode) OpCode {
 	return OpHalt
 }
 
+// deadConditionalJumpOptimizerDisabled disables optimizeDeadConditionalJumpPass.
+// Tests use it to compile the same program with and without the pass and assert that the
+// executed output is identical (differential oracle). Production code never sets it.
+var deadConditionalJumpOptimizerDisabled bool
+
 // optimizeDeadConditionalJumpPass removes unreachable true-branches for compile-time
-// false conditions in `OpJumpIfFalse` patterns by NOP-filling bytes up to jump target.
+// false conditions in `OpJumpIfFalse` patterns by NOP-filling bytes up to the jump target.
+//
+// Cost: one linear scan, O(N) per invocation. The predecessor instruction start is carried
+// in prevInstrStart while decoding forward instead of rescanning the bytecode from offset 0
+// for every conditional jump (the previous findPreviousInstructionStart call made the pass
+// O(N^2) and dominated compilation time of large pages).
+//
+// IP-drift safety across self-mutations: every blanked byte is written as OpNop, which
+// opcodeOperandSize resolves to a one-byte instruction, so the linear walk remains exact.
+// After blanking the dead range [instrEnd, target) the walk resumes at the jump target, so
+// the skipped bytes are never decoded as operands of the jump instruction. Conversely, a
+// decoded OpNop never overwrites prevInstrStart, which keeps the recorded predecessor valid
+// across padding nops produced by this pass or by the peephole passes.
 func (c *Compiler) optimizeDeadConditionalJumpPass() bool {
 	if c == nil || len(c.bytecode) == 0 {
+		return false
+	}
+	if deadConditionalJumpOptimizerDisabled {
 		return false
 	}
 
 	targets := collectJumpTargets(c.bytecode)
 	changed := false
 
+	// prevInstrStart is the start offset of the last decoded instruction that is not an
+	// OpNop. All starts between prevInstrStart and ip are one-byte OpNop instructions, so
+	// the O(1) lookup below replaces the former backward padding walk exactly.
+	prevInstrStart := -1
+
 	for ip := 0; ip < len(c.bytecode); {
+		// Three-way sync: byte consumption is derived strictly from opcodeOperandSize,
+		// including variable-length extended opcodes (OpExtPrefix).
 		op := OpCode(c.bytecode[ip])
 		size := opcodeOperandSize(op, c.bytecode, ip)
 		instrEnd := ip + 1 + size
@@ -279,9 +306,19 @@ func (c *Compiler) optimizeDeadConditionalJumpPass() bool {
 		}
 
 		if op != OpJumpIfFalse {
+			// Blanked bytes are one-byte instructions: they advance the walk but never
+			// become the recorded predecessor.
+			if op != OpNop {
+				prevInstrStart = ip
+			}
 			ip = instrEnd
 			continue
 		}
+
+		// The conditional jump is a real instruction, so it becomes the recorded
+		// predecessor for the next step whether or not the dead branch is removed.
+		condStart := prevInstrStart
+		prevInstrStart = ip
 
 		target := int(binary.BigEndian.Uint32(c.bytecode[ip+1 : ip+5]))
 		if target <= instrEnd || target > len(c.bytecode) || target <= ip {
@@ -289,10 +326,6 @@ func (c *Compiler) optimizeDeadConditionalJumpPass() bool {
 			continue
 		}
 
-		condStart := findPreviousInstructionStart(c.bytecode, ip)
-		for condStart >= 0 && OpCode(c.bytecode[condStart]) == OpNop {
-			condStart = findPreviousInstructionStart(c.bytecode, condStart)
-		}
 		if condStart < 0 || OpCode(c.bytecode[condStart]) != OpConstant || condStart+3 > len(c.bytecode) {
 			ip = instrEnd
 			continue
@@ -348,23 +381,6 @@ func isCompileTimeFalseValue(v Value) bool {
 	default:
 		return false
 	}
-}
-
-func findPreviousInstructionStart(bytecode []byte, before int) int {
-	if before <= 0 || len(bytecode) == 0 {
-		return -1
-	}
-	prev := -1
-	for ip := 0; ip < len(bytecode) && ip < before; {
-		size := opcodeOperandSize(OpCode(bytecode[ip]), bytecode, ip)
-		next := ip + 1 + size
-		if next > before {
-			break
-		}
-		prev = ip
-		ip = next
-	}
-	return prev
 }
 
 type intStackValue struct {

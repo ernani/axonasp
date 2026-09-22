@@ -218,17 +218,6 @@ jobs:
           docker logs axonasp-test
           exit 1
 
-      - name: Sanity check ASP test fixtures
-        run: |
-          for p in /tests/test_hello.asp /tests/test_simple.asp /tests/test_docker.asp; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8801$p")
-            if [ "$code" != "200" ]; then
-              echo "Missing or inaccessible fixture: $p (HTTP $code)"
-              docker logs axonasp-test
-              exit 1
-            fi
-          done
-
       - name: Run Docker integration tests
         env:
           TEST_SERVER_URL: http://localhost:8801

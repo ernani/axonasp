@@ -319,6 +319,9 @@ func TestGetFastCGIParam(t *testing.T) {
 
 // TestFastCGIMiddlewareSetsPoweredByHeader verifies FastCGI responses emit X-Powered-By: AxonASP.
 func TestFastCGIMiddlewareSetsPoweredByHeader(t *testing.T) {
+	original := ExposeServerHeaders
+	ExposeServerHeaders = true
+	defer func() { ExposeServerHeaders = original }()
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "http://example.local/", nil)
 	handler := fastCGIMiddleware(func(w http.ResponseWriter, r *http.Request) {
@@ -329,6 +332,24 @@ func TestFastCGIMiddlewareSetsPoweredByHeader(t *testing.T) {
 
 	if got := rec.Header().Get("X-Powered-By"); got != "AxonASP" {
 		t.Fatalf("expected X-Powered-By header AxonASP, got %q", got)
+	}
+}
+
+func TestFastCGIMiddlewareCanSuppressPoweredByHeader(t *testing.T) {
+	original := ExposeServerHeaders
+	ExposeServerHeaders = false
+	defer func() { ExposeServerHeaders = original }()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://example.local/", nil)
+	handler := fastCGIMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	handler(rec, req)
+
+	if got := rec.Header().Get("X-Powered-By"); got != "" {
+		t.Fatalf("expected no X-Powered-By header, got %q", got)
 	}
 }
 

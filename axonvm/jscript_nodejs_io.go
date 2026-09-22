@@ -123,7 +123,7 @@ func (vm *VM) jsRequireFileModule(moduleName string) (Value, bool, bool) {
 	vm.jsPropertyItems[moduleObjID] = make(map[string]jsPropertyDescriptor, 4)
 	moduleVal := Value{Type: VTJSObject, Num: moduleObjID}
 
-	moduleEnvID := vm.allocJSID()
+	moduleEnvID := vm.allocJSEnvID()
 	moduleEnv := &jsEnvFrame{parentID: rootEnvID, bindings: make(map[string]Value, 12)}
 	moduleEnv.bindings["module"] = moduleVal
 	moduleEnv.bindings["exports"] = exportsVal

@@ -30,11 +30,42 @@ import (
 	"time"
 )
 
+// TestProgramPoolCreatesNoEagerVMs verifies a new program pool starts empty.
 func TestProgramPoolCreatesNoEagerVMs(t *testing.T) {
 	program := CachedProgram{SourceName: t.Name(), ProgramHash: 1}
 	pool := getProgramPool(program)
 	if got := len(pool.items); got != 0 {
 		t.Fatalf("new program pool eagerly allocated %d VMs", got)
+	}
+}
+
+// TestPurgeVMProgramPoolsDropsIdleInstances verifies hosted runtimes can release
+// every idle pooled VM when they unload, and that the pool is rebuilt on demand.
+func TestPurgeVMProgramPoolsDropsIdleInstances(t *testing.T) {
+	compiler := NewASPCompiler(`<% Response.Write "ok" %>`)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	program := cachedProgramFromCompiler(compiler)
+
+	idle := AcquireVMFromCachedProgram(program)
+	idle.Release()
+
+	key := pooledProgramKey(program)
+	if _, ok := cachedProgramPools.Load(key); !ok {
+		t.Fatalf("expected a program pool entry after release")
+	}
+
+	PurgeVMProgramPools()
+
+	if _, ok := cachedProgramPools.Load(key); ok {
+		t.Fatalf("expected the purged program pool entry to be removed")
+	}
+
+	reused := AcquireVMFromCachedProgram(program)
+	defer reused.Release()
+	if reused == idle {
+		t.Fatalf("expected a fresh VM instance after purge")
 	}
 }
 

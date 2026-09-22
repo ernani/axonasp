@@ -33,7 +33,7 @@ Next, navigate to the `caddy` module directory within the AxonASP repository and
 
 ```bash
 cd ./caddy
-xcaddy build --with g3pix.com.br/axonasp/v2/caddy=. --replace g3pix.com.br/axonasp=..
+xcaddy build --with g3pix.com.br/axonasp/caddy=. --replace "g3pix.com.br/axonasp/v2=.."
 ```
 
 On Windows, you can also use the included PowerShell build script:
@@ -128,6 +128,19 @@ To prevent unauthorized public web access to sensitive server files, the module 
 - **Targeted Files:** Direct HTTP requests for `global.asa` and `MyInfo.xml` (case-insensitively, anywhere in the URL path) are intercepted.
 - **Client Response:** The server immediately returns an HTTP `404 Not Found` error to external web clients, concealing the existence of the files.
 - **Internal Engine Access:** Internal AxonASP processes (such as `Application_OnStart` initialization, script inclusion, and server mapping) read and process these files directly from the filesystem without restriction.
+
+### Engine Version Reporting
+
+`xcaddy` does not forward linker flags to the build, so the module resolves the engine version from the Go build information recorded for the module instead of relying on `-X` injection. The resolved value is stored in the runtime and is returned by `AxVersion()` and by the runtime information banner.
+
+Resolution order:
+
+1. **Linker Injection:** A version set with `-X g3pix.com.br/axonasp/caddy.Version=<version>` is used as-is.
+2. **Module Metadata:** The recorded version of the module. Tagged builds report the release tag (for example `2.3.22`); source builds report the release line plus the short commit (for example `2.3.0.9ded92f`).
+3. **Build Revision:** The `vcs.revision` stamp written by the Go toolchain when the build runs from a repository checkout.
+4. **Fallback:** The value `2.3.0`.
+
+When the Caddy core version is present in the build information, it is appended as build metadata, so the reported value identifies the exact engine and server pair (for example `2.3.0.9ded92f+caddy.2.11.4`). The module writes the resolved version to its log during provisioning.
 
 ## Configuration File Resolution
 

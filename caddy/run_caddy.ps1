@@ -44,7 +44,7 @@ if (-not (Test-Path "caddy.exe")) {
 
     $ParentDir = (Get-Item "..").FullName
     Write-Host "Building custom Caddy executable with AxonASP module via xcaddy..." -ForegroundColor Yellow
-    & $XcaddyExec build --with g3pix.com.br/axonasp/caddy=. --replace "g3pix.com.br/axonasp=$ParentDir" --replace "github.com/google/cel-go=github.com/google/cel-go@v0.20.1"
+    & $XcaddyExec build --with g3pix.com.br/axonasp/caddy=. --replace "g3pix.com.br/axonasp/v2=$ParentDir"
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Failed to compile custom Caddy server using xcaddy."
         exit 1

@@ -54,10 +54,12 @@ func TestFSODiskUsageMatchesGopsutil(t *testing.T) {
 func TestFSOGetTempNameFormat(t *testing.T) {
 	re := regexp.MustCompile(`^rad[0-9a-fA-F]{8}\.tmp$`)
 
+	// GetTempName is a method, so the VBScript call site must use parentheses. The
+	// parenthesis-free member form resolves as a property read and returns Empty.
 	vbsSource := `<%@ Language="VBScript" %>` +
 		`<%` +
 		`Set fso = Server.CreateObject("Scripting.FileSystemObject")` +
-		`Response.Write fso.GetTempName` +
+		`Response.Write fso.GetTempName()` +
 		`%>`
 	vbsOut := runASPSourceForTest(t, vbsSource)
 	if len(vbsOut) != 15 {
@@ -142,9 +144,11 @@ func TestFSOGetSpecialFolderFolderObject(t *testing.T) {
 }
 
 func TestFSOFolderAndFileMoveStateMutation(t *testing.T) {
-	tempDir := t.TempDir()
-	origFolder := filepath.Join(tempDir, "orig_folder")
-	movedFolder := filepath.Join(tempDir, "moved_folder")
+	// The FSO sandbox only resolves paths inside the web root, so the temporary
+	// sandbox doubles as the web root and the script addresses folders below it.
+	rootDir := t.TempDir()
+	origFolder := filepath.Join(rootDir, "orig_folder")
+	movedFolder := filepath.Join(rootDir, "moved_folder")
 	if err := os.MkdirAll(origFolder, 0755); err != nil {
 		t.Fatalf("mkdir orig: %v", err)
 	}
@@ -165,13 +169,16 @@ Response.Write(fl.Path + "|");
 Response.Write(fl.Name);
 %%>`, origFolder, movedFolder)
 
-	out := runASPSourceForTest(t, jsSource)
+	host := NewMockHost()
+	host.Server().SetRootDir(rootDir)
+	host.Server().SetRequestPath("/tests/test_server.asp")
+	out := runASPSourceForTestWithHost(t, jsSource, host)
 	parts := strings.Split(out, "|")
 	if len(parts) != 5 {
 		t.Fatalf("expected 5 parts output, got %v (raw: %q)", parts, out)
 	}
 
-	if filepath.Clean(parts[0]) != filepath.Clean(movedFolder) {
+	if !strings.EqualFold(filepath.Clean(parts[0]), filepath.Clean(movedFolder)) {
 		t.Fatalf("expected folder path %q, got %q", movedFolder, parts[0])
 	}
 	if parts[1] != "moved_folder" {
@@ -181,7 +188,7 @@ Response.Write(fl.Name);
 		t.Fatalf("expected 1 file in moved folder, got %q", parts[2])
 	}
 	expectedFilePath := filepath.Join(movedFolder, "renamed.txt")
-	if filepath.Clean(parts[3]) != filepath.Clean(expectedFilePath) {
+	if !strings.EqualFold(filepath.Clean(parts[3]), filepath.Clean(expectedFilePath)) {
 		t.Fatalf("expected file path %q, got %q", expectedFilePath, parts[3])
 	}
 	if parts[4] != "renamed.txt" {

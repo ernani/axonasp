@@ -77,6 +77,7 @@ var (
 	ScriptTimeout                 = 60
 	ResponseBufferLimitBytes      = 4 * 1024 * 1024
 	DebugASP                      = false
+	ExposeServerHeaders           = true
 	CleanupSessions               = true
 	CleanupCache                  = true
 	DefaultTimezone               = "UTC"
@@ -170,6 +171,7 @@ func loadFastCGIConfig() {
 		axonvm.SetInternalErrorLogRootPath(workingDir)
 	}
 	DebugASP = v.GetBool("global.enable_asp_debugging")
+	ExposeServerHeaders = !v.IsSet("server.expose_server_headers") || v.GetBool("server.expose_server_headers")
 	axonvm.SetInternalErrorLogEnabled(v.GetBool("global.enable_error_log_file"))
 	axonvm.SetDumpPreprocessedSourceEnabled(v.GetBool("global.dump_preprocessed_source"))
 
@@ -642,7 +644,9 @@ func main() {
 // middleware also ensures FastCGI responses advertise AxonASP via X-Powered-By.
 func fastCGIMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Powered-By", "AxonASP")
+		if ExposeServerHeaders {
+			w.Header().Set("X-Powered-By", "AxonASP")
+		}
 		next(w, r)
 	}
 }

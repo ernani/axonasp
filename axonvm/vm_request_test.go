@@ -89,11 +89,50 @@ func TestVMRequestDefaultCallMissingValuePreservesCollectionSemantics(t *testing
 	if result.Type != VTNativeObject {
 		t.Fatalf("expected missing Request value wrapper, got %#v", result)
 	}
-	if got := vm.jsToString(result); got != "" {
-		t.Fatalf("expected empty string conversion, got %q", got)
+	if got := vm.jsToString(result); got != "undefined" {
+		t.Fatalf("expected undefined string conversion, got %q", got)
 	}
 	if got := vm.jsToNumber(result); got.Type != VTDouble || !math.IsNaN(got.Flt) {
 		t.Fatalf("expected missing Request value to convert to NaN, got %#v", got)
+	}
+}
+
+func TestJScriptMissingRequestStringRemainsEmptyAcrossFunctionReturn(t *testing.T) {
+	host := NewMockHost()
+	source := `<%@ Language="JScript" %><%
+function initialize() {
+    var optionalValue = String(Request("optional_value"));
+    Response.Write(typeof optionalValue + "|" + optionalValue + "|" + Server.URLEncode(optionalValue));
+}
+initialize();
+%>`
+
+	if got := runASPSourceForTestWithHost(t, source, host); got != "string|undefined|undefined" {
+		t.Fatalf("unexpected missing Request value after function return: %q", got)
+	}
+}
+
+func TestJScriptMissingRequestStringIsEmptyAtTopLevel(t *testing.T) {
+	host := NewMockHost()
+	source := `<%@ Language="JScript" %><% Response.Write("[" + String(Request("optional_value")) + "]"); %>`
+
+	if got := runASPSourceForTestWithHost(t, source, host); got != "[undefined]" {
+		t.Fatalf("unexpected top-level missing Request value: %q", got)
+	}
+}
+
+func TestJScriptRequestDistinguishesMissingAndPresentEmptyValues(t *testing.T) {
+	host := NewMockHost()
+	host.Request().QueryString.SetLazyPayload([]byte("mode=new&optional_type="))
+	source := `<%@ Language="JScript" %><%
+var missing = String(Request("selection"));
+var empty = String(Request("optional_type"));
+var selected = missing == "undefined" ? "default" : "first";
+Response.Write(missing + "|" + empty + "|" + selected);
+%>`
+
+	if got := runASPSourceForTestWithHost(t, source, host); got != "undefined||default" {
+		t.Fatalf("unexpected missing/present-empty Request distinction: %q", got)
 	}
 }
 

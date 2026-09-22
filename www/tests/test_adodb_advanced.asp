@@ -3,6 +3,7 @@
 %>
 <!DOCTYPE html>
 <html>
+
     <head>
         <title>ADODB Advanced Features Test</title>
         <style>
@@ -10,39 +11,48 @@
                 font-family: Arial, sans-serif;
                 margin: 20px;
             }
+
             h2 {
                 color: #333;
                 border-bottom: 2px solid #007bff;
                 padding-bottom: 5px;
             }
+
             .success {
                 color: green;
                 font-weight: bold;
             }
+
             .error {
                 color: red;
                 font-weight: bold;
             }
+
             .info {
                 color: blue;
             }
+
             table {
                 border-collapse: collapse;
                 margin: 10px 0;
             }
+
             th,
             td {
                 border: 1px solid #ddd;
                 padding: 8px;
                 text-align: left;
             }
+
             th {
                 background-color: #007bff;
                 color: white;
             }
+
             tr:nth-child(even) {
                 background-color: #f2f2f2;
             }
+
             .section {
                 margin: 20px 0;
                 padding: 15px;
@@ -51,6 +61,7 @@
             }
         </style>
     </head>
+
     <body>
         <h1>ADODB Advanced Features Test</h1>
 
@@ -74,12 +85,12 @@
 
             Response.Write "<p><strong>Testing Supports() method:</strong></p>"
             Response.Write "<ul>"
-            Response.Write "<li>Supports AddNew (0x1000400): " & rs.Supports( & H1000400) & "</li>"
-            Response.Write "<li>Supports Delete (0x1000800): " & rs.Supports( & H1000800) & "</li>"
-            Response.Write "<li>Supports Update (0x1008000): " & rs.Supports( & H1008000) & "</li>"
-            Response.Write "<li>Supports MovePrevious (0x200): " & rs.Supports( & H200) & "</li>"
-            Response.Write "<li>Supports Find (0x80000): " & rs.Supports( & H80000) & "</li>"
-            Response.Write "<li>Supports Bookmark (0x2000): " & rs.Supports( & H2000) & " (not implemented)</li>"
+            Response.Write "<li>Supports AddNew (0x1000400): " & rs.Supports(&H1000400) & "</li>"
+            Response.Write "<li>Supports Delete (0x1000800): " & rs.Supports(&H1000800) & "</li>"
+            Response.Write "<li>Supports Update (0x1008000): " & rs.Supports(&H1008000) & "</li>"
+            Response.Write "<li>Supports MovePrevious (0x200): " & rs.Supports(&H200) & "</li>"
+            Response.Write "<li>Supports Find (0x80000): " & rs.Supports(&H80000) & "</li>"
+            Response.Write "<li>Supports Bookmark (0x2000): " & rs.Supports(&H2000) & " (not implemented)</li>"
             Response.Write "</ul>"
 
             Response.Write "<p class='success'>✓ Supports() method working correctly</p>"
@@ -278,4 +289,5 @@
             <a href="default.asp">← Back to Home</a>
         </p>
     </body>
+
 </html>

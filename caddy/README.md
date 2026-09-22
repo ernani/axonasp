@@ -35,13 +35,43 @@ go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 cd ./caddy
 
 # Build Caddy binary with AxonASP module
-xcaddy build --with g3pix.com.br/axonasp/v2/caddy=. --replace g3pix.com.br/axonasp=.. --replace github.com/google/cel-go=github.com/google/cel-go@v0.20.1
+xcaddy build --with g3pix.com.br/axonasp/caddy=. --replace "g3pix.com.br/axonasp/v2=.."
 ```
+
+**Important:** always run `xcaddy` from inside the `caddy` directory. The `=.` replacement is resolved relative to the Go module of the current working directory, so running it from the repository root points the module replacement at the parent module and the build fails with `cannot find module providing package g3pix.com.br/axonasp/caddy`.
+
+### Engine Version Reporting
+
+`xcaddy` does not forward linker flags to the build, so the module resolves the engine version from the Go build information instead of relying on `-X` injection:
+
+- **Tagged builds** report the release tag, such as `2.3.22`.
+- **Source builds** report the release line plus the short commit, such as `2.3.0.9ded92f`.
+- **Caddy core** is appended as build metadata, such as `2.3.0.9ded92f+caddy.2.11.4`.
+
+The resolved value is returned by `AxVersion()` and written to the module log during provisioning. Builds that require an exact version can stamp it with `-X g3pix.com.br/axonasp/caddy.Version=<version>` when compiling the module directly with `go build`.
 
 ### Compiling from a Go module path / remote repository
 
 ```bash
-xcaddy build --with g3pix.com.br/axonasp/v2/caddy --replace github.com/google/cel-go=github.com/google/cel-go@v0.20.1
+xcaddy build --with g3pix.com.br/axonasp/caddy
+```
+
+### Multi-Platform Build Scripts
+
+Cross-platform build scripts are available to compile Caddy for Windows, Linux, and macOS (amd64, arm64, 386):
+
+```powershell
+# PowerShell (Windows default)
+.\build_caddy.ps1                      # Builds for Windows (amd64)
+.\build_caddy.ps1 -Platform linux      # Cross-compiles for Linux (amd64)
+.\build_caddy.ps1 -Platform all -Architecture all # Builds all platforms & architectures
+```
+
+```bash
+# Bash (Linux default)
+./build_caddy.sh                      # Builds for Linux (amd64)
+./build_caddy.sh --platform windows   # Cross-compiles for Windows (amd64)
+./build_caddy.sh --platform all --arch all # Builds all platforms & architectures
 ```
 
 ### Running with PowerShell script (Windows)

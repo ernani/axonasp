@@ -103,6 +103,7 @@ type CliConfig struct {
 
 // ServerConfig maps the [server] configuration section.
 type ServerConfig struct {
+	ExposeServerHeaders        bool     `toml:"expose_server_headers" comment:"When true, HTTP and FastCGI responses identify AxonASP through Server and X-Powered-By headers. Disable this to suppress implementation-identifying response headers."`
 	DefaultErrorPagesDirectory string   `toml:"default_error_pages_directory" comment:"The directory where the server will look for default error pages. When an error occurs (e.g., 404 Not Found, 500 Internal Server Error), the server will check this directory for corresponding error page files (e.g., 404.html, 500.asp) and serve them to the client. If no custom error page is found, the server will return a default error message. You can customize this directory and the error pages to provide a better user experience when errors occur on your website. This configuration may be overridden by settings in the web.config file of your ASP application, allowing you to specify different error pages for different applications or directories."`
 	WebRoot                    string   `toml:"web_root" comment:"The root directory for the web server. This is the base directory from which the server will serve files. When a client makes a request, the server will look for the requested file within this directory. For example, if the web_root is set to \"./www\" and a client requests \"/index.html\", the server will look for \"./www/index.html\". Make sure to set this to the correct path where your ASP applications and static files are located. This configuration can't be be overridden by settings in the web.config file of your ASP application."`
 	DefaultPages               []string `toml:"default_pages" comment:"List of default pages to try when a directory is accessed. The server will look for these files in order and serve the first one it finds."`
@@ -330,6 +331,7 @@ func NewDefaultConfig() Config {
 			EngineMode:                  "default",
 		},
 		Server: ServerConfig{
+			ExposeServerHeaders:        true,
 			DefaultErrorPagesDirectory: "./www/error-pages",
 			WebRoot:                    "./www/",
 			DefaultPages: []string{

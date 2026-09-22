@@ -9,13 +9,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -34,6 +33,7 @@ var (
 	_ caddy.Module                = (*AxonASP)(nil)
 	_ caddy.Provisioner           = (*AxonASP)(nil)
 	_ caddy.Validator             = (*AxonASP)(nil)
+	_ caddy.CleanerUpper          = (*AxonASP)(nil)
 	_ caddyhttp.MiddlewareHandler = (*AxonASP)(nil)
 	_ caddyfile.Unmarshaler       = (*AxonASP)(nil)
 )
@@ -57,100 +57,187 @@ type AxonASP struct {
 	application *asp.Application
 	config      *viper.Viper
 
-	vmPools *vmPoolManager
-
 	resolvedConfigPath string
 }
 
-type vmPoolManager struct {
-	mu    sync.Mutex
-	pools map[string]unsafe.Pointer
-}
+// Version is the AxonASP Caddy module version. Build scripts may stamp it with
+// -X g3pix.com.br/axonasp/caddy.Version=<version>; otherwise the module resolves
+// the version from the Go build info at provision time.
+var Version = ""
 
-type localVMProgramPool struct {
-	mu          sync.Mutex
-	items       []*axonvm.VM
-	maxRetained int
-	program     axonvm.CachedProgram
-}
-
-var Version = "0.0.0.0"
-
-var (
-	vmPooledFromOffset uintptr
-	vmPooledSlotOffset uintptr
-	vmPooledFromFound  bool
-	vmPooledSlotFound  bool
-	offsetOnce         sync.Once
+const (
+	// axonaspVersionLine is the AxonASP release line used when the build does not
+	// provide an explicit version.
+	axonaspVersionLine = "2.3"
+	// axonaspVersionFallback is used when no build metadata is available at all.
+	axonaspVersionFallback = axonaspVersionLine + ".0"
+	// axonaspModulePath identifies this module inside the Go build info.
+	axonaspModulePath = "g3pix.com.br/axonasp/caddy"
+	// caddyCoreModulePath identifies the Caddy core module inside the Go build info.
+	caddyCoreModulePath = "github.com/caddyserver/caddy/v2"
+	// shortRevisionLength is the number of commit characters kept in a version.
+	shortRevisionLength = 7
 )
 
-func initOffsets(vmType reflect.Type) {
-	offsetOnce.Do(func() {
-		for f := range vmType.Fields() {
-			switch f.Name {
-			case "pooledFrom":
-				vmPooledFromOffset = f.Offset
-				vmPooledFromFound = true
-			case "pooledSlot":
-				vmPooledSlotOffset = f.Offset
-				vmPooledSlotFound = true
+// resolveRuntimeVersion returns the version reported by AxVersion() and by the
+// runtime banner inside the Caddy host. xcaddy does not accept linker flags, so
+// resolution falls back to the Go build info in this order:
+//  1. Version injected with -X g3pix.com.br/axonasp/caddy.Version=...
+//  2. the module version of this package, which is a release tag for tagged
+//     builds and a pseudo-version (timestamp plus commit) for source builds
+//  3. the VCS revision stamped by the Go toolchain
+//  4. axonaspVersionFallback
+//
+// The Caddy core version is appended as build metadata, so the reported engine
+// version identifies the exact AxonASP and Caddy pair in use.
+func resolveRuntimeVersion() string {
+	if injected := strings.TrimSpace(Version); injected != "" {
+		return injected
+	}
+
+	buildInfo, ok := debug.ReadBuildInfo()
+	if !ok {
+		return axonaspVersionFallback
+	}
+
+	resolved := versionFromModuleInfo(buildInfo)
+	if resolved == "" {
+		resolved = versionFromVCSStamp(buildInfo)
+	}
+	if resolved == "" {
+		resolved = axonaspVersionFallback
+	}
+
+	if caddyVersion := coreCaddyVersion(buildInfo); caddyVersion != "" && !strings.Contains(resolved, "+") {
+		resolved += "+caddy." + caddyVersion
+	}
+	return resolved
+}
+
+// versionFromModuleInfo derives the AxonASP version from the module metadata
+// recorded for this package in the Go build info.
+func versionFromModuleInfo(buildInfo *debug.BuildInfo) string {
+	if buildInfo == nil {
+		return ""
+	}
+
+	for _, dep := range buildInfo.Deps {
+		if dep == nil || dep.Path != axonaspModulePath {
+			continue
+		}
+		moduleVersion := strings.TrimSpace(dep.Version)
+		if moduleVersion == "" && dep.Replace != nil {
+			moduleVersion = strings.TrimSpace(dep.Replace.Version)
+		}
+		return normalizeBuildVersion(moduleVersion)
+	}
+	return ""
+}
+
+// normalizeBuildVersion converts a Go module version into the AxonASP version
+// format: release tags keep their numeric form (2.3.22), while pseudo-versions
+// (v0.0.0-20260907212856-9ded92f3cc7a) degrade to line plus short revision
+// (2.3.0.9ded92f).
+func normalizeBuildVersion(moduleVersion string) string {
+	moduleVersion = strings.TrimPrefix(strings.TrimSpace(moduleVersion), "v")
+	if moduleVersion == "" || moduleVersion == "0.0.0" {
+		return ""
+	}
+
+	if isReleaseVersion(moduleVersion) {
+		return moduleVersion
+	}
+	if strings.HasPrefix(moduleVersion, axonaspVersionFallback+"-") || strings.HasPrefix(moduleVersion, "0.0.0-") {
+		revision := pseudoVersionRevision(moduleVersion)
+		if revision == "" {
+			return ""
+		}
+		return axonaspVersionFallback + "." + revision
+	}
+	return moduleVersion
+}
+
+// isReleaseVersion reports whether a module version is a plain MAJOR.MINOR.PATCH tag.
+func isReleaseVersion(version string) bool {
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for i := range len(part) {
+			if part[i] < '0' || part[i] > '9' {
+				return false
 			}
 		}
-	})
+	}
+	return true
 }
 
-func setVMPrivateFields(vm *axonvm.VM, pool unsafe.Pointer, slot chan struct{}) {
-	initOffsets(reflect.TypeFor[axonvm.VM]())
+// pseudoVersionRevision extracts the short commit hash from a Go pseudo-version.
+func pseudoVersionRevision(version string) string {
+	lastDash := strings.LastIndexByte(version, '-')
+	if lastDash < 0 || lastDash == len(version)-1 {
+		return ""
+	}
 
-	if vmPooledFromFound {
-		ptr := unsafe.Pointer(uintptr(unsafe.Pointer(vm)) + vmPooledFromOffset)
-		*(*unsafe.Pointer)(ptr) = pool
+	revision := version[lastDash+1:]
+	if len(revision) > shortRevisionLength {
+		revision = revision[:shortRevisionLength]
 	}
-	if vmPooledSlotFound {
-		ptr := unsafe.Pointer(uintptr(unsafe.Pointer(vm)) + vmPooledSlotOffset)
-		*(*chan struct{})(ptr) = slot
-	}
+	return revision
 }
 
+// versionFromVCSStamp derives a version from the VCS metadata the Go toolchain
+// stamps into the binary when the build runs from a checkout.
+func versionFromVCSStamp(buildInfo *debug.BuildInfo) string {
+	if buildInfo == nil {
+		return ""
+	}
+
+	revision := ""
+	for _, setting := range buildInfo.Settings {
+		if setting.Key == "vcs.revision" {
+			revision = strings.TrimSpace(setting.Value)
+			break
+		}
+	}
+	if revision == "" {
+		return ""
+	}
+	if len(revision) > shortRevisionLength {
+		revision = revision[:shortRevisionLength]
+	}
+	return axonaspVersionFallback + "." + revision
+}
+
+// coreCaddyVersion returns the Caddy core version without its leading "v".
+func coreCaddyVersion(buildInfo *debug.BuildInfo) string {
+	if buildInfo == nil {
+		return ""
+	}
+
+	for _, dep := range buildInfo.Deps {
+		if dep == nil || dep.Path != caddyCoreModulePath {
+			continue
+		}
+		version := strings.TrimSpace(dep.Version)
+		if version == "" && dep.Replace != nil {
+			version = strings.TrimSpace(dep.Replace.Version)
+		}
+		return strings.TrimPrefix(version, "v")
+	}
+	return ""
+}
+
+// AcquireVM borrows a VM instance from the shared AxonASP interpreter pool.
+// The axonvm runtime pools instances per compiled program, so recycling is
+// owned by the VM package and this module never touches VM internals.
 func (a *AxonASP) AcquireVM(program axonvm.CachedProgram) *axonvm.VM {
-	key := program.SourceName
-	if key == "" {
-		key = fmt.Sprintf("hash:%d", program.ProgramHash)
-	}
-
-	a.vmPools.mu.Lock()
-	poolPtr, ok := a.vmPools.pools[key]
-	if !ok {
-		pool := &localVMProgramPool{
-			maxRetained: 250,
-			program:     program,
-		}
-		// Pre-warm the pool
-		for range 5 {
-			vm := axonvm.NewVMFromCachedProgram(program)
-			setVMPrivateFields(vm, unsafe.Pointer(pool), nil)
-			pool.items = append(pool.items, vm)
-		}
-		poolPtr = unsafe.Pointer(pool)
-		a.vmPools.pools[key] = poolPtr
-	}
-	a.vmPools.mu.Unlock()
-
-	pool := (*localVMProgramPool)(poolPtr)
-	pool.mu.Lock()
-	var vm *axonvm.VM
-	if len(pool.items) > 0 {
-		vm = pool.items[len(pool.items)-1]
-		pool.items = pool.items[:len(pool.items)-1]
-	}
-	pool.mu.Unlock()
-
-	if vm == nil {
-		vm = axonvm.NewVMFromCachedProgram(program)
-		setVMPrivateFields(vm, poolPtr, nil)
-	}
-
-	return vm
+	return axonvm.AcquireVMFromCachedProgram(program)
 }
 
 // CaddyModule returns the Caddy module information.
@@ -163,11 +250,12 @@ func (AxonASP) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up the AxonASP Caddy module.
 func (a *AxonASP) Provision(ctx caddy.Context) error {
-	axonvm.SetRuntimeVersion(strings.TrimSpace(Version))
-
 	a.logger = ctx.Logger(a)
 
-	a.vmPools = &vmPoolManager{pools: make(map[string]unsafe.Pointer)}
+	// xcaddy does not accept linker flags, so the engine version is resolved from
+	// the build info recorded for this module instead of relying on -X injection.
+	runtimeVersion := resolveRuntimeVersion()
+	axonvm.SetRuntimeVersion(runtimeVersion)
 
 	if strings.TrimSpace(a.ConfigFile) != "" {
 		resolved, err := filepath.Abs(a.ConfigFile)
@@ -215,7 +303,7 @@ func (a *AxonASP) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("failed to normalize local config resource paths: %w", normalizeErr)
 	}
 	a.config = v
-	a.logger.Info("Loaded AxonASP config for Caddy", zap.String("path", configPath))
+	a.logger.Info("Loaded AxonASP config for Caddy", zap.String("path", configPath), zap.String("version", runtimeVersion))
 
 	siteTemp := a.resolveSiteTempDir(nil)
 	a.setupSiteTempDir(siteTemp)
@@ -282,6 +370,19 @@ func (a *AxonASP) Validate() error {
 			return fmt.Errorf("configured global_asa_path does not exist: %s", a.GlobalAsaPath)
 		}
 	}
+	return nil
+}
+
+// Cleanup releases every resource owned by this handler when Caddy unloads or
+// reloads the module: the bytecode cache invalidator, the pooled VM instances
+// and the G3AxonLive background sweeper. This keeps configuration reloads from
+// stacking idle VM workers and goroutines in the process.
+func (a *AxonASP) Cleanup() error {
+	if a.scriptCache != nil {
+		a.scriptCache.StopInvalidator()
+	}
+	axonvm.PurgeVMProgramPools()
+	axonvm.G3ALStopCleanup()
 	return nil
 }
 

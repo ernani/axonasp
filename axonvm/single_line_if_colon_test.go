@@ -104,55 +104,28 @@ End If
 	}
 }
 
-// TestSingleLineIfTagBoundaryReproduction validates Issue 1 reproduction where an ASP tag boundary
-// separates a statement on the same line as Then from an explicit End If.
-func TestSingleLineIfTagBoundaryReproduction(t *testing.T) {
-	source := `<% Dim x : x = 1 : If x = 1 Then Response.Write "one" %><% End If %>`
-	compiler := NewASPCompiler(source)
-	if err := compiler.Compile(); err != nil {
-		t.Fatalf("compile failed: %v", err)
-	}
-
-	out := runVBSAndGetOutput(t, source)
-	expected := "one"
-	if out != expected {
-		t.Fatalf("unexpected output: got %q, want %q", out, expected)
-	}
+// TestSingleLineIfTagBoundaryRejectsOrphanEndIf verifies that a single-line If is already
+// complete when the ASP tag boundary terminates its branch body, so an End If in the next
+// script block is orphaned and rejected with the VBScript missing End error (800A03F6).
+func TestSingleLineIfTagBoundaryRejectsOrphanEndIf(t *testing.T) {
+	requireOrphanEndIfError(t, `<% Dim x : x = 1 : If x = 1 Then Response.Write "one" %><% End If %>`)
 }
 
-// TestSingleLineIfTagBoundaryFalseBranch verifies that when condition is false, the statement is skipped.
-func TestSingleLineIfTagBoundaryFalseBranch(t *testing.T) {
-	source := `<% Dim x : x = 2 : If x = 1 Then Response.Write "one" %><% End If %>`
-	compiler := NewASPCompiler(source)
-	if err := compiler.Compile(); err != nil {
-		t.Fatalf("compile failed: %v", err)
-	}
-
-	out := runVBSAndGetOutput(t, source)
-	expected := ""
-	if out != expected {
-		t.Fatalf("unexpected output: got %q, want %q", out, expected)
-	}
+// TestSingleLineIfTagBoundaryFalseBranchRejectsOrphanEndIf verifies the same closure rule
+// when the single-line If branch is not taken.
+func TestSingleLineIfTagBoundaryFalseBranchRejectsOrphanEndIf(t *testing.T) {
+	requireOrphanEndIfError(t, `<% Dim x : x = 2 : If x = 1 Then Response.Write "one" %><% End If %>`)
 }
 
-// TestSingleLineIfTagBoundaryWithWhitespaceAndNewlines verifies that whitespace or newlines between %> and <%
-// do not break the tag boundary recognition for trailing End If.
-func TestSingleLineIfTagBoundaryWithWhitespaceAndNewlines(t *testing.T) {
-	source := `<%
+// TestSingleLineIfTagBoundaryWithWhitespaceAndNewlinesRejectsOrphanEndIf verifies that
+// whitespace or newlines between %> and <% do not turn an orphan End If into a closer of
+// the single-line If that the tag boundary already completed.
+func TestSingleLineIfTagBoundaryWithWhitespaceAndNewlinesRejectsOrphanEndIf(t *testing.T) {
+	requireOrphanEndIfError(t, `<%
 Dim x : x = 1
 If x = 1 Then Response.Write "one" %>
    
-<% End If %>`
-	compiler := NewASPCompiler(source)
-	if err := compiler.Compile(); err != nil {
-		t.Fatalf("compile failed: %v", err)
-	}
-
-	out := runVBSAndGetOutput(t, source)
-	expected := "one"
-	if out != expected {
-		t.Fatalf("unexpected output: got %q, want %q", out, expected)
-	}
+<% End If %>`)
 }
 
 // TestSingleLineIfTagBoundaryWithElse verifies Else branches across ASP tag boundaries.

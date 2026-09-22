@@ -519,14 +519,14 @@ func TestMSXMLServerXMLHTTPSendNetworkFailures(t *testing.T) {
 	closedAddr := ln.Addr().String()
 	_ = ln.Close()
 
-	aspSource := fmt.Sprintf(`<%s
+	aspSource := fmt.Sprintf(`<%%
 On Error Resume Next
 Dim http
 Set http = Server.CreateObject("MSXML2.ServerXMLHTTP")
 http.Open "GET", "http://%s/test", False
 http.Send
 Response.Write Hex(Err.Number) & "|" & Err.Description
-%%>`, "", closedAddr)
+%%>`, closedAddr)
 
 	output := runASPSource(t, aspSource, nil)
 	expectedPrefix := "80072EFD|A connection with the server could not be established"
@@ -580,7 +580,7 @@ func TestMSXMLServerXMLHTTPStatusGetterInASP(t *testing.T) {
 	closedAddr := ln.Addr().String()
 	_ = ln.Close()
 
-	aspSource := fmt.Sprintf(`<%s
+	aspSource := fmt.Sprintf(`<%%
 On Error Resume Next
 Dim http, st
 Set http = Server.CreateObject("MSXML2.ServerXMLHTTP")
@@ -589,7 +589,7 @@ http.Send
 Err.Clear
 st = http.Status
 Response.Write Hex(Err.Number) & "|" & Err.Description
-%%>`, "", closedAddr)
+%%>`, closedAddr)
 
 	output := runASPSource(t, aspSource, nil)
 	expectedPrefix := "8000000A|The data necessary to complete this operation is not yet available"
@@ -608,13 +608,13 @@ func TestMSXMLServerXMLHTTPSuccess(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	aspSource := fmt.Sprintf(`<%s
+	aspSource := fmt.Sprintf(`<%%
 Dim http
 Set http = Server.CreateObject("MSXML2.ServerXMLHTTP")
 http.Open "GET", "%s", False
 http.Send
 Response.Write http.Status & "|" & http.StatusText & "|" & http.ResponseText & "|" & http.GetResponseHeader("X-Custom-Header")
-%%>`, "", ts.URL)
+%%>`, ts.URL)
 
 	output := runASPSource(t, aspSource, nil)
 	expected := "200|200 OK|response payload|AxonTest"

@@ -32,6 +32,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
+
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/korean"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/traditionalchinese"
+	"golang.org/x/text/transform"
 )
 
 // ResponseEndSignal is used to terminate script execution after Response.End/Redirect.
@@ -60,6 +69,13 @@ type ResponseCookie struct {
 	HTTPOnly   bool
 }
 
+type responseSegment struct {
+	start    int
+	end      int
+	codePage int
+	binary   bool
+}
+
 // Response controls the output sent to the client.
 type Response struct {
 	Output io.Writer
@@ -67,6 +83,7 @@ type Response struct {
 	req    *http.Request
 
 	buffer         *bytes.Buffer
+	segments       []responseSegment
 	mu             sync.RWMutex
 	ended          bool
 	flushed        bool
@@ -112,6 +129,7 @@ func NewResponse(output io.Writer) *Response {
 	r := &Response{
 		Output:         output,
 		buffer:         buf,
+		segments:       make([]responseSegment, 0, 8),
 		bufferEnabled:  true,
 		maxBufferBytes: DefaultResponseBufferLimitBytes,
 		cacheControl:   "Private",
@@ -218,6 +236,95 @@ func contentTypeSupportsCharset(contentType string) bool {
 	}
 }
 
+func responseEncoding(codePage int) encoding.Encoding {
+	switch codePage {
+	case 37:
+		return charmap.CodePage037
+	case 437:
+		return charmap.CodePage437
+	case 850:
+		return charmap.CodePage850
+	case 852:
+		return charmap.CodePage852
+	case 855:
+		return charmap.CodePage855
+	case 858:
+		return charmap.CodePage858
+	case 860:
+		return charmap.CodePage860
+	case 862:
+		return charmap.CodePage862
+	case 863:
+		return charmap.CodePage863
+	case 865:
+		return charmap.CodePage865
+	case 866:
+		return charmap.CodePage866
+	case 874:
+		return charmap.Windows874
+	case 932:
+		return japanese.ShiftJIS
+	case 936:
+		return simplifiedchinese.GBK
+	case 949:
+		return korean.EUCKR
+	case 950:
+		return traditionalchinese.Big5
+	case 1250:
+		return charmap.Windows1250
+	case 1251:
+		return charmap.Windows1251
+	case 1252:
+		return charmap.Windows1252
+	case 1253:
+		return charmap.Windows1253
+	case 1254:
+		return charmap.Windows1254
+	case 1255:
+		return charmap.Windows1255
+	case 1256:
+		return charmap.Windows1256
+	case 1257:
+		return charmap.Windows1257
+	case 1258:
+		return charmap.Windows1258
+	default:
+		return nil
+	}
+}
+
+func encodeResponseBody(data []byte, codePage int) []byte {
+	enc := responseEncoding(codePage)
+	if enc == nil || len(data) == 0 {
+		return data
+	}
+	var encoded bytes.Buffer
+	encoded.Grow(len(data))
+	for _, codeUnit := range utf16.Encode([]rune(string(data))) {
+		part, _, err := transform.String(enc.NewEncoder(), string(rune(codeUnit)))
+		if err != nil {
+			encoded.WriteByte('?')
+			continue
+		}
+		encoded.WriteString(part)
+	}
+	return encoded.Bytes()
+}
+
+func (r *Response) appendSegmentLocked(start, end int, binary bool) {
+	if start >= end {
+		return
+	}
+	if count := len(r.segments); count > 0 {
+		last := &r.segments[count-1]
+		if last.end == start && last.binary == binary && (binary || last.codePage == r.codePage) {
+			last.end = end
+			return
+		}
+	}
+	r.segments = append(r.segments, responseSegment{start: start, end: end, codePage: r.codePage, binary: binary})
+}
+
 // Write appends a string to the HTTP output buffer.
 func (r *Response) Write(s string) {
 	r.mu.Lock()
@@ -226,9 +333,11 @@ func (r *Response) Write(s string) {
 	if r.ended || r.buffer == nil {
 		return
 	}
+	start := r.buffer.Len()
 	r.ensureBufferCapacityLocked(r.buffer.Len() + len(s))
 	// Optimization: Use WriteString to avoid heap allocation from implicit []byte(s) conversion.
 	_, _ = r.buffer.WriteString(s)
+	r.appendSegmentLocked(start, r.buffer.Len(), false)
 	if !r.bufferEnabled {
 		r.flushInternal()
 	}
@@ -242,8 +351,10 @@ func (r *Response) BinaryWrite(data []byte) {
 	if r.ended || r.buffer == nil {
 		return
 	}
+	start := r.buffer.Len()
 	r.ensureBufferCapacityLocked(r.buffer.Len() + len(data))
 	_, _ = r.buffer.Write(data)
+	r.appendSegmentLocked(start, r.buffer.Len(), true)
 	if !r.bufferEnabled {
 		r.flushInternal()
 	}
@@ -360,6 +471,7 @@ func (r *Response) Clear() {
 		return
 	}
 	r.buffer.Reset()
+	r.segments = r.segments[:0]
 	r.flushed = false
 }
 
@@ -388,6 +500,7 @@ func (r *Response) Redirect(location string) {
 	}
 	if r.buffer != nil {
 		r.buffer.Reset()
+		r.segments = r.segments[:0]
 	}
 	r.headers.Set("Location", location)
 	r.status = "302 Found"
@@ -809,8 +922,23 @@ func (r *Response) flushInternal() {
 	}
 
 	if r.buffer != nil && r.buffer.Len() > 0 {
-		_, _ = r.Output.Write(r.buffer.Bytes())
+		body := r.buffer.Bytes()
+		if len(r.segments) > 0 {
+			for _, segment := range r.segments {
+				if segment.start < 0 || segment.end > len(body) || segment.start >= segment.end {
+					continue
+				}
+				part := body[segment.start:segment.end]
+				if !segment.binary {
+					part = encodeResponseBody(part, segment.codePage)
+				}
+				_, _ = r.Output.Write(part)
+			}
+		} else {
+			_, _ = r.Output.Write(body)
+		}
 		r.buffer.Reset()
+		r.segments = r.segments[:0]
 	}
 
 	if flusher, ok := r.Output.(http.Flusher); ok {
@@ -826,6 +954,7 @@ func (r *Response) ReleaseBuffer() {
 	r.mu.Lock()
 	buf := r.buffer
 	r.buffer = nil
+	r.segments = nil
 	r.mu.Unlock()
 	if buf != nil && buf.Cap() > 0 && buf.Cap() <= maxPooledBufferCap {
 		buf.Reset()
