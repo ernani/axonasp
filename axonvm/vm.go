@@ -638,9 +638,11 @@ type VM struct {
 	// perf regression tests in clone-sensitive JScript paths.
 	cloneForExecuteLocalCount uint64
 
-	nextCallMemberICID uint32
-	callMemberIC       map[uint32]callMemberICEntry
-	icState            []InlineCacheSlot // VM-local inline cache state indexed by ICNodeID
+	// callMemberIC caches resolved member calls per VM, keyed by the bytecode
+	// offset of the OpCallMember operand slot. It must stay VM-local: writing
+	// this state into the shared compiled bytecode leaks it across requests.
+	callMemberIC map[int]callMemberICEntry
+	icState      []InlineCacheSlot // VM-local inline cache state indexed by ICNodeID
 }
 
 func (vm *VM) mapRuntimeLocation(line int, column int) (string, int, int) {
@@ -854,8 +856,7 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		consoleTimerItems:  make(map[string]time.Time),
 		terminateCursor:    -1,
 		jsDirectCallHaltIP: -1,
-		nextCallMemberICID: 1,
-		callMemberIC:       make(map[uint32]callMemberICEntry, 32),
+		callMemberIC:       make(map[int]callMemberICEntry, 32),
 	}
 
 	// 1. Inject ASP Native Objects (Indices 0-7)
@@ -3280,8 +3281,11 @@ aspExecLoop:
 			vm.ip += 2
 			argCount := int(binary.BigEndian.Uint16(vm.bytecode[vm.ip:]))
 			vm.ip += 2
-			cacheOffset := vm.ip
-			cacheID := binary.BigEndian.Uint32(vm.bytecode[cacheOffset:])
+			// The four operand bytes are a compiler-reserved call-site slot. The
+			// resolved entry lives in the VM-local callMemberIC map: program
+			// bytecode is shared read-only by every request, so it must never be
+			// patched in place.
+			cacheSite := vm.ip
 			vm.ip += 4
 
 			memberArgs := vm.ensureArgBuffer(argCount)
@@ -3300,40 +3304,39 @@ aspExecLoop:
 			if target.Type == VTArgRef {
 				target = vm.unwrapArgRefValue(target)
 			}
-			if cacheID != 0 {
-				if cacheEntry, exists := vm.callMemberIC[cacheID]; exists && cacheEntry.expectedType == target.Type && cacheEntry.expectedNum == target.Num {
-					switch cacheEntry.kind {
-					case callMemberICClassMethod:
-						if cacheEntry.target.UserSubParamCount() != argCount {
-							vm.raise(vbscript.WrongNumberOfParameters, "Wrong number of parameters or invalid property assignment")
-						}
-						var memberByRefs []byRefWriteback
-						if hasArgRefMember {
-							memberByRefs = vm.collectByRefsAndUnwrap(memberArgs, cacheEntry.target.UserSubByRefMask())
-						}
-						if vm.beginUserSubCall(cacheEntry.target, memberArgs, false, target.Num, memberByRefs) {
-							continue
-						}
-					case callMemberICClassPropertyGet:
-						var propByRefs []byRefWriteback
-						if hasArgRefMember {
-							propByRefs = vm.collectByRefsAndUnwrap(memberArgs, cacheEntry.target.UserSubByRefMask())
-						}
-						if vm.beginUserSubCall(cacheEntry.target, memberArgs, false, target.Num, propByRefs) {
-							continue
-						}
-					case callMemberICNativeMember:
-						var nativeByRefs []byRefWriteback
-						if hasArgRefMember {
-							nativeByRefs = vm.collectByRefsAndUnwrap(memberArgs, vm.nativeByRefMask(target.Num, cacheEntry.nativeMember))
-						}
-						result := vm.dispatchNativeCall(target.Num, cacheEntry.nativeMember, memberArgs)
-						if len(nativeByRefs) > 0 {
-							vm.applyByRefWritebacksFromArgs(nativeByRefs, memberArgs)
-						}
-						vm.push(result)
+			cacheEntry, cacheHit := vm.callMemberIC[cacheSite]
+			if cacheHit && cacheEntry.expectedType == target.Type && cacheEntry.expectedNum == target.Num {
+				switch cacheEntry.kind {
+				case callMemberICClassMethod:
+					if cacheEntry.target.UserSubParamCount() != argCount {
+						vm.raise(vbscript.WrongNumberOfParameters, "Wrong number of parameters or invalid property assignment")
+					}
+					var memberByRefs []byRefWriteback
+					if hasArgRefMember {
+						memberByRefs = vm.collectByRefsAndUnwrap(memberArgs, cacheEntry.target.UserSubByRefMask())
+					}
+					if vm.beginUserSubCall(cacheEntry.target, memberArgs, false, target.Num, memberByRefs) {
 						continue
 					}
+				case callMemberICClassPropertyGet:
+					var propByRefs []byRefWriteback
+					if hasArgRefMember {
+						propByRefs = vm.collectByRefsAndUnwrap(memberArgs, cacheEntry.target.UserSubByRefMask())
+					}
+					if vm.beginUserSubCall(cacheEntry.target, memberArgs, false, target.Num, propByRefs) {
+						continue
+					}
+				case callMemberICNativeMember:
+					var nativeByRefs []byRefWriteback
+					if hasArgRefMember {
+						nativeByRefs = vm.collectByRefsAndUnwrap(memberArgs, vm.nativeByRefMask(target.Num, cacheEntry.nativeMember))
+					}
+					result := vm.dispatchNativeCall(target.Num, cacheEntry.nativeMember, memberArgs)
+					if len(nativeByRefs) > 0 {
+						vm.applyByRefWritebacksFromArgs(nativeByRefs, memberArgs)
+					}
+					vm.push(result)
+					continue
 				}
 			}
 			switch target.Type {
@@ -3358,14 +3361,13 @@ aspExecLoop:
 				}
 				methodTarget, ok := vm.resolveRuntimeClassMethod(target, methodName, requirePublic)
 				if ok {
-					if cacheID == 0 {
-						cacheID = vm.allocateCallMemberIC(callMemberICEntry{
+					if !cacheHit {
+						vm.setCallMemberIC(cacheSite, callMemberICEntry{
 							kind:         callMemberICClassMethod,
 							expectedType: target.Type,
 							expectedNum:  target.Num,
 							target:       methodTarget,
 						})
-						binary.BigEndian.PutUint32(vm.bytecode[cacheOffset:], cacheID)
 					}
 					if methodTarget.UserSubParamCount() != argCount {
 						vm.raise(vbscript.WrongNumberOfParameters, "Wrong number of parameters or invalid property assignment")
@@ -3384,14 +3386,13 @@ aspExecLoop:
 				}
 				propertyTarget, ok := vm.resolveRuntimeClassPropertyGet(target, propertyName, argCount, requirePublic)
 				if ok {
-					if cacheID == 0 {
-						cacheID = vm.allocateCallMemberIC(callMemberICEntry{
+					if !cacheHit {
+						vm.setCallMemberIC(cacheSite, callMemberICEntry{
 							kind:         callMemberICClassPropertyGet,
 							expectedType: target.Type,
 							expectedNum:  target.Num,
 							target:       propertyTarget,
 						})
-						binary.BigEndian.PutUint32(vm.bytecode[cacheOffset:], cacheID)
 					}
 					var propByRefs []byRefWriteback
 					if hasArgRefMember {
@@ -3432,14 +3433,13 @@ aspExecLoop:
 				vm.push(Value{Type: VTEmpty})
 			case VTNativeObject:
 				memberName := vm.constants[memberIdx].Str
-				if cacheID == 0 {
-					cacheID = vm.allocateCallMemberIC(callMemberICEntry{
+				if !cacheHit {
+					vm.setCallMemberIC(cacheSite, callMemberICEntry{
 						kind:         callMemberICNativeMember,
 						expectedType: target.Type,
 						expectedNum:  target.Num,
 						nativeMember: memberName,
 					})
-					binary.BigEndian.PutUint32(vm.bytecode[cacheOffset:], cacheID)
 				}
 				var nativeByRefs []byRefWriteback
 				if hasArgRefMember {
@@ -9774,24 +9774,18 @@ func (vm *VM) applyByRefWritebacksFromArgs(byRefs []byRefWriteback, args []Value
 	}
 }
 
-// allocateCallMemberIC stores one call-site cache entry and returns a stable 32-bit cache ID.
-func (vm *VM) allocateCallMemberIC(entry callMemberICEntry) uint32 {
+// setCallMemberIC stores the resolved member call for one bytecode call site.
+// The site key is the bytecode offset of the OpCallMember operand slot, which is
+// unique within the program the VM is executing. Keeping the entry VM-local
+// avoids writing runtime state into the shared, read-only program bytecode.
+func (vm *VM) setCallMemberIC(site int, entry callMemberICEntry) {
 	if vm == nil {
-		return 0
+		return
 	}
 	if vm.callMemberIC == nil {
-		vm.callMemberIC = make(map[uint32]callMemberICEntry, 32)
+		vm.callMemberIC = make(map[int]callMemberICEntry, 32)
 	}
-	id := vm.nextCallMemberICID
-	if id == 0 {
-		id = 1
-	}
-	vm.callMemberIC[id] = entry
-	vm.nextCallMemberICID = id + 1
-	if vm.nextCallMemberICID == 0 {
-		vm.nextCallMemberICID = 1
-	}
-	return id
+	vm.callMemberIC[site] = entry
 }
 
 // bytesToVBByteString converts raw bytes to a VB-compatible byte-string representation.
