@@ -45,6 +45,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # Digest of the image pushed by this run. Consumers (docker-test) must use it
+    # instead of a mutable tag, otherwise a concurrently published image from the
+    # same GHCR package can be pulled and tested by mistake.
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout repository
@@ -97,6 +102,7 @@ jobs:
             type=ref,event=pr
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -156,6 +162,10 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Both jobs publish into the same GHCR package. Keep the Caddy edition out
+          # of the shared `latest` tag, which belongs to the standard AxonASP image.
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=caddy
             type=sha,prefix=caddy-sha-,format=short
@@ -199,10 +209,18 @@ jobs:
 
       - name: Start AxonASP container
         run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.docker.outputs.digest }}"
+          echo "Testing image: ${IMAGE}"
           docker run -d \
             --name axonasp-test \
             -p 8801:8801 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            "${IMAGE}"
+
+      - name: Verify container runs the ASP runtime with the test fixtures
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.docker.outputs.digest }}"
+          docker run --rm --entrypoint sh "${IMAGE}" -c \
+            "test -f ./axonasp-http && test -f ./default_www/tests/test_hello.asp && test -f ./default_www/tests/test_simple.asp && test -f ./default_www/tests/test_docker.asp"
 
       - name: Wait for server to be ready
         run: |

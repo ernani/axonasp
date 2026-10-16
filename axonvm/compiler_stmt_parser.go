@@ -227,12 +227,17 @@ func (c *Compiler) parseStatement() {
 			name := c.expectIdentifier()
 
 			if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctLParen {
-				op, idx := c.resolveVar(name)
-				c.emit(op, idx)
+				if strings.EqualFold(name, "Me") && c.currentClassName != "" {
+					c.emit(OpMe)
+				} else {
+					op, idx := c.resolveVar(name)
+					c.emit(op, idx)
+				}
 				argCount := c.parseParenArgumentList()
 				if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctEqual {
 					c.move()
 					c.parseExpression(PrecNone)
+					c.undoTrailingCoerce()
 					midx := c.addConstant(NewString(""))
 					c.emit(OpArraySet, midx, argCount)
 					return
@@ -246,8 +251,12 @@ func (c *Compiler) parseStatement() {
 			}
 
 			if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctDot {
-				op, idx := c.resolveVar(name)
-				c.emit(op, idx)
+				if strings.EqualFold(name, "Me") && c.currentClassName != "" {
+					c.emit(OpMe)
+				} else {
+					op, idx := c.resolveVar(name)
+					c.emit(op, idx)
+				}
 				c.parseSetMemberAssignmentChain()
 				return
 			}
@@ -1134,6 +1143,13 @@ func (c *Compiler) parseSetMemberAssignmentChain() {
 		}
 
 		if hasCall {
+			if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctEqual {
+				c.move()
+				c.parseExpression(PrecNone)
+				c.undoTrailingCoerce()
+				c.emit(OpArraySet, midx, argCount)
+				return
+			}
 			panic(c.vbCompileError(vbscript.SyntaxError, "Expected member name after indexed call target in Set assignment"))
 		}
 
@@ -1921,6 +1937,7 @@ func (c *Compiler) parseClassMethodDeclaration(className string, isFunc bool, is
 	}
 
 	prevIsLocal := c.isLocal
+	prevInsideClassMethod := c.insideClassMethod
 	prevLocals := c.locals
 	prevDeclared := c.declaredLocals
 	prevConstLocals := c.constLocals
@@ -1933,6 +1950,7 @@ func (c *Compiler) parseClassMethodDeclaration(className string, isFunc bool, is
 	prevLocalRecordTypes := c.localRecordTypes
 
 	c.isLocal = true
+	c.insideClassMethod = true
 	c.currentClassName = className
 	c.locals = NewSymbolTable()
 	c.declaredLocals = make(map[string]bool)
@@ -2058,6 +2076,7 @@ func (c *Compiler) parseClassMethodDeclaration(className string, isFunc bool, is
 	}
 
 	c.isLocal = prevIsLocal
+	c.insideClassMethod = prevInsideClassMethod
 	c.currentClassName = prevClassName
 	c.locals = prevLocals
 	c.declaredLocals = prevDeclared
@@ -2120,6 +2139,7 @@ func (c *Compiler) parseClassPropertyDeclaration(className string, isPublic bool
 	}
 
 	prevIsLocal := c.isLocal
+	prevInsideClassMethod := c.insideClassMethod
 	prevLocals := c.locals
 	prevDeclared := c.declaredLocals
 	prevConstLocals := c.constLocals
@@ -2132,6 +2152,7 @@ func (c *Compiler) parseClassPropertyDeclaration(className string, isPublic bool
 	prevLocalRecordTypes := c.localRecordTypes
 
 	c.isLocal = true
+	c.insideClassMethod = true
 	c.currentClassName = className
 	c.locals = NewSymbolTable()
 	c.declaredLocals = make(map[string]bool)
@@ -2261,6 +2282,7 @@ func (c *Compiler) parseClassPropertyDeclaration(className string, isPublic bool
 	}
 
 	c.isLocal = prevIsLocal
+	c.insideClassMethod = prevInsideClassMethod
 	c.currentClassName = prevClassName
 	c.locals = prevLocals
 	c.declaredLocals = prevDeclared
@@ -2974,15 +2996,29 @@ func (c *Compiler) compileImplicitClassStatementCall(name string, hasParen bool)
 	if trimmedName == "" || strings.EqualFold(trimmedName, c.currentFunctionName) {
 		return false
 	}
-	if globalIdx, exists := c.Globals.Get(trimmedName); exists && globalIdx < c.userGlobalsStart {
-		// Keep ASP intrinsics/VBScript builtins and constants (pre-user-global slots)
-		// bound as globals inside class methods; do not rewrite them as Me.<member>().
+	// An indexed assignment such as dict("key") = value must never be rewritten as
+	// Me.dict("key"): declining here routes the statement back to the normal
+	// identifier path, which emits OpArraySet once the '=' is seen.
+	if hasParen && c.isArrayAssignmentAhead() {
 		return false
+	}
+	lowerName := strings.ToLower(trimmedName)
+	if globalIdx, exists := c.Globals.Get(trimmedName); exists {
+		if globalIdx < c.userGlobalsStart ||
+			c.declaredGlobals[lowerName] ||
+			c.constGlobals[lowerName] ||
+			c.implicitGlobals[lowerName] {
+			// Keep ASP intrinsics/VBScript builtins, user-declared globals (Dim'ed
+			// variables, dictionaries, arrays) and module-level Sub/Function names
+			// bound as globals inside class methods; never rewrite them as
+			// Me.<member>().
+			return false
+		}
 	}
 	if _, exists := c.locals.Get(trimmedName); exists {
 		return false
 	}
-	if _, exists := BuiltinIndex[strings.ToLower(trimmedName)]; exists {
+	if _, exists := BuiltinIndex[lowerName]; exists {
 		return false
 	}
 	if c.hasClassFieldDeclaration(c.currentClassName, trimmedName) {

@@ -4,7 +4,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas GuimarÃ£es - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -43,6 +43,21 @@ func TestADODBDateTimeValuePreservesDateType(t *testing.T) {
 	}
 	if milliseconds := vm.jsToNumber(got); milliseconds.Type != VTDouble || milliseconds.Flt != float64(want.UnixMilli()) {
 		t.Fatalf("unexpected JScript date numeric coercion: %#v", milliseconds)
+	}
+}
+
+func TestJScriptConnectionPropertiesExposeDatabaseMetadata(t *testing.T) {
+	host := NewMockHost()
+	source := `<%@ Language="JScript" %><%
+var db = Server.CreateObject("ADODB.Connection");
+db.Open("sqlite::memory:");
+Response.Write(String(db.Properties("DBMS Name")) + "|");
+Response.Write(String(db.Properties("DBMS Version")).length > 0 ? "version" : "missing");
+Response.Write("|" + String(db.Properties("Current Catalog")));
+db.Close();
+%>`
+	if got := runASPSourceForTestWithHost(t, source, host); got != "SQLite|version|main" {
+		t.Fatalf("unexpected connection properties: %q", got)
 	}
 }
 

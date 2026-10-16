@@ -1,11 +1,11 @@
 module g3pix.com.br/axonasp/caddy
 
-go 1.27
+go 1.27.2
 
 replace g3pix.com.br/axonasp/v2 => ../
 
 require (
-	g3pix.com.br/axonasp/v2 v2.3.20
+	g3pix.com.br/axonasp/v2 v2.3.29
 	github.com/caddyserver/caddy/v2 v2.11.4
 	github.com/spf13/viper v1.21.0
 	go.uber.org/zap v1.28.0
@@ -199,7 +199,7 @@ require (
 	gopkg.in/alexcesaro/quotedprintable.v3 v3.0.0-20150716171945-2caba252f4dc // indirect
 	gopkg.in/gomail.v2 v2.0.0-20160411212932-81ebce5c23df // indirect
 	howett.net/plist v1.0.0 // indirect
-	modernc.org/libc v1.77.0 // indirect
+	modernc.org/libc v1.77.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 	modernc.org/sqlite v1.59.0 // indirect

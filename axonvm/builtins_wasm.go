@@ -4,7 +4,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -236,6 +236,18 @@ func vbsTypeNameVM(vm *VM, args []Value) (Value, error) {
 func vbsArray(args []Value) (Value, error) {
 	values := make([]Value, len(args))
 	copy(values, args)
+	return Value{Type: VTArray, Arr: NewVBArrayFromValues(0, values)}, nil
+}
+
+// vbsArrayVM creates a VBScript Variant array and increments object reference counts for VTObject elements.
+func vbsArrayVM(vm *VM, args []Value) (Value, error) {
+	values := make([]Value, len(args))
+	copy(values, args)
+	if vm != nil {
+		for _, v := range values {
+			vm.incrementObjectRefCount(v)
+		}
+	}
 	return Value{Type: VTArray, Arr: NewVBArrayFromValues(0, values)}, nil
 }
 
@@ -858,7 +870,7 @@ func vbsParseNumericString(text string) (float64, vbscript.VBSyntaxErrorCode, bo
 		return sign * float64(parsed), 0, true
 	}
 
-	parsed, err := strconv.ParseFloat(trimmed, 64)
+	parsed, err := strconv.ParseFloat(strings.ReplaceAll(trimmed, ",", ""), 64)
 	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
 		return 0, vbscript.TypeMismatch, false
 	}
@@ -1353,13 +1365,15 @@ func vbsAxonEnumValues(vm *VM, args []Value) (Value, error) {
 		return ValueFromVBArray(NewVBArrayFromValues(0, values)), nil
 	}
 
-	if rs, ok := vm.adodbFieldsCollectionItems[target.Num]; ok && rs != nil {
-		values := make([]Value, 0, len(rs.columns))
-		for i := 0; i < len(rs.columns); i++ {
-			values = append(values, vm.newADODBFieldProxy(rs, rs.columns[i]))
+	/*
+		if rs, ok := vm.adodbFieldsCollectionItems[target.Num]; ok && rs != nil {
+			values := make([]Value, 0, len(rs.columns))
+			for i := 0; i < len(rs.columns); i++ {
+				values = append(values, vm.newADODBFieldProxyByOrdinal(rs, i))
+			}
+			return ValueFromVBArray(NewVBArrayFromValues(0, values)), nil
 		}
-		return ValueFromVBArray(NewVBArrayFromValues(0, values)), nil
-	}
+	*/
 
 	// ADOX.Tables collection — yield one VTNativeObject per table item.
 	if tables, ok := vm.adoxTablesItems[target.Num]; ok && tables != nil {
@@ -1578,7 +1592,7 @@ func init() {
 	RegisterBuiltin("IsObject", bindBuiltin(vbsIsObject))
 	RegisterBuiltin("Erl", vbsErlVM)
 	RegisterBuiltin("TypeName", vbsTypeNameVM)
-	RegisterBuiltin("Array", bindBuiltin(vbsArray))
+	RegisterBuiltin("Array", vbsArrayVM)
 	RegisterBuiltin("LBound", vbsLBoundVM)
 	RegisterBuiltin("UBound", vbsUBoundVM)
 

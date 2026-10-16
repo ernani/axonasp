@@ -2,7 +2,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -210,6 +210,12 @@ type Compiler struct {
 	staticLocals         map[string]int               // Static local variables mapping (localName -> globalIndex)
 	constLiteralGlobals  map[string]Value             // Compile-time known global constant values
 	isLocal              bool                         // True if currently compiling a Sub/Function
+	// insideClassMethod is true only while compiling the body of a Class member
+	// procedure (Sub, Function, Property Get/Let/Set). Microsoft VBScript does not
+	// enforce Option Explicit inside Class member bodies, so an assignment to an
+	// undeclared name must create an implicit procedure-local variable there
+	// instead of raising "Variable not defined" (800A01F4).
+	insideClassMethod bool
 
 	// Compilation Options
 	optionExplicit         bool // Requires variables to be Dim'ed
@@ -1074,37 +1080,13 @@ func preprocessASPIncludesWithDepsWithOptions(source string, sourceName string, 
 			upperComment := strings.ToUpper(comment)
 
 			if strings.Contains(upperComment, "#INCLUDE") {
-				// Parse directive
-				kindIdx := -1
-				if strings.Contains(upperComment, "VIRTUAL") {
-					kind = "virtual"
-					kindIdx = strings.Index(upperComment, "VIRTUAL")
-				} else if strings.Contains(upperComment, "FILE") {
+				if path, virtual, ok := vbscript.ParseASPIncludeComment(comment); ok {
 					kind = "file"
-					kindIdx = strings.Index(upperComment, "FILE")
-				}
-
-				if kindIdx != -1 {
-					valPart := comment[kindIdx+len(kind):]
-					eqIdx := strings.Index(valPart, "=")
-					if eqIdx != -1 {
-						valPart = valPart[eqIdx+1:]
-						valPart = strings.TrimSpace(valPart)
-						if len(valPart) > 0 {
-							quote := valPart[0]
-							if quote == '"' || quote == '\'' {
-								valPart = valPart[1:]
-								before, _, ok := strings.Cut(valPart, string(quote))
-								if ok {
-									pathVal = before
-									startIdx = absStart
-									endIdx = absEnd
-									directive = comment
-									break
-								}
-							}
-						}
+					if virtual {
+						kind = "virtual"
 					}
+					pathVal, startIdx, endIdx, directive = path, absStart, absEnd, comment
+					break
 				}
 				searchCursor = absStart + 4
 				continue
@@ -1171,8 +1153,8 @@ func preprocessASPIncludesWithDepsWithOptions(source string, sourceName string, 
 
 		mergeSourceMap(&sourceMap, childMap, currentMergedLine)
 		builder.WriteString(expanded)
-		currentMergedLine += countLogicalLines(expanded)
-		currentSourceLine += countLogicalLines(source[replaceStart:replaceEnd])
+		currentMergedLine += countLineBreaks(expanded)
+		currentSourceLine += countLineBreaks(source[replaceStart:replaceEnd])
 		cursor = replaceEnd
 	}
 
@@ -1277,18 +1259,6 @@ func countLineBreaks(s string) int {
 	return count
 }
 
-// countLogicalLines returns legacy logical-line count (minimum 1 for non-empty segments).
-func countLogicalLines(s string) int {
-	if s == "" {
-		return 0
-	}
-	breaks := countLineBreaks(s)
-	if strings.HasSuffix(s, "\n") || strings.HasSuffix(s, "\r") {
-		return breaks
-	}
-	return breaks + 1
-}
-
 // appendMappedSegment appends one source segment and updates merged/source line cursors.
 func appendMappedSegment(builder *strings.Builder, sourceMap *SourceMap, segment string, sourceName string, currentMergedLine *int, currentSourceLine *int) {
 	if segment == "" {
@@ -1296,9 +1266,9 @@ func appendMappedSegment(builder *strings.Builder, sourceMap *SourceMap, segment
 	}
 	sourceMap.AddBoundary(*currentMergedLine, sourceName, *currentSourceLine)
 	builder.WriteString(segment)
-	logicalLines := countLogicalLines(segment)
-	*currentMergedLine += logicalLines
-	*currentSourceLine += logicalLines
+	breaks := countLineBreaks(segment)
+	*currentMergedLine += breaks
+	*currentSourceLine += breaks
 }
 
 // mergeSourceMap appends one child source map into a parent map at one merged-line offset.
@@ -1510,7 +1480,9 @@ func (c *Compiler) resolveVar(name string) (OpCode, int) {
 	if idx, exists := c.Globals.Get(name); exists {
 		isTrueGlobal := idx < c.userGlobalsStart || c.declaredGlobals[lower] || c.constGlobals[lower] || c.implicitGlobals[lower]
 		if c.isLocal && !isTrueGlobal {
-			if c.optionExplicit {
+			// Class member bodies are exempt from Option Explicit: the name becomes
+			// an implicit procedure-local variable, matching Microsoft VBScript.
+			if c.optionExplicit && !c.insideClassMethod {
 				panic(c.vbCompileError(vbscript.VariableNotDefined, fmt.Sprintf("Variable not defined: '%s'", name)))
 			}
 			lidx := c.locals.Add(name)
@@ -1648,7 +1620,10 @@ func (c *Compiler) resolveSetVar(name string) (OpCode, int) {
 				return OpSetGlobal, gidx
 			}
 		}
-		if c.optionExplicit {
+		// Class member bodies are exempt from Option Explicit: assignment to an
+		// undeclared name creates an implicit procedure-local variable, matching
+		// Microsoft VBScript behavior inside Class methods and property procedures.
+		if c.optionExplicit && !c.insideClassMethod {
 			panic(c.vbCompileError(vbscript.VariableNotDefined, fmt.Sprintf("Variable not defined: '%s'", name)))
 		}
 		idx := c.locals.Add(name)
@@ -1869,13 +1844,24 @@ func (c *Compiler) skipTopLevelDefinitionBlock(endKeyword vbscript.Keyword) {
 	}
 }
 
-// isArrayAssignmentAhead checks whether the tokens following an identifier like name( ... ) are followed by '='
+// isArrayAssignmentAhead reports whether the parenthesised index list owned by the
+// current statement identifier is terminated by '=' (indexed assignment) instead of
+// starting a procedure-call argument list.
+//
+// The opening parenthesis is already consumed in statement position: parseStatement
+// runs c.move() over the identifier, so c.next holds the '(' while c.lexer is parked
+// AFTER it. Depth therefore starts at 1 whenever c.next is '('. The pre-scan caller
+// (prebindTopLevelDimDeclarations) leaves c.next on the identifier and the lexer on
+// the '(', which the same initialization handles without an off-by-one.
 func (c *Compiler) isArrayAssignmentAhead() bool {
 	if c == nil || c.lexer == nil {
 		return false
 	}
 	lexerCopy := *c.lexer
 	depth := 0
+	if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctLParen {
+		depth = 1
+	}
 	for {
 		tok := lexerCopy.NextToken()
 		if tok == nil {
@@ -1891,11 +1877,20 @@ func (c *Compiler) isArrayAssignmentAhead() bool {
 			case vbscript.PunctRParen:
 				depth--
 				if depth == 0 {
-					nextTok := lexerCopy.NextToken()
-					if np, ok := nextTok.(*vbscript.PunctuationToken); ok && np.Type == vbscript.PunctEqual {
-						return true
+					// Tolerate comments between the closing parenthesis and '='.
+					for {
+						nextTok := lexerCopy.NextToken()
+						if nextTok == nil {
+							return false
+						}
+						if _, ok := nextTok.(*vbscript.CommentToken); ok {
+							continue
+						}
+						if np, ok := nextTok.(*vbscript.PunctuationToken); ok && np.Type == vbscript.PunctEqual {
+							return true
+						}
+						return false
 					}
-					return false
 				}
 			}
 		}

@@ -109,6 +109,57 @@ Response.Write(input.mode + "|" + input.start + "|" + JSON.stringify(input));
 	}
 }
 
+func TestJScriptRequestCollectionItemCountMissingAndPresent(t *testing.T) {
+	host := NewMockHost()
+	host.Request().QueryString.Add("mode", "brief")
+	source := `<%@ Language="JScript" %><%
+var missing = Request.QueryString("absent");
+var present = Request.QueryString("mode");
+Response.Write(missing.Count + ":" + typeof missing.Count + ":" + (missing.Count === 0) + ":" + String(missing) + "|");
+Response.Write(present.Count + ":" + typeof present.Count + ":" + (present.Count === 1) + ":" + String(present));
+%>`
+	if got := runASPSourceForTestWithHost(t, source, host); got != "0:number:true:undefined|1:number:true:brief" {
+		t.Fatalf("unexpected request collection item counts: %q", got)
+	}
+}
+
+func TestJScriptFormAndCookieItemCountMissingAndPresent(t *testing.T) {
+	host := NewMockHost()
+	host.Request().Form.Add("name", "sample")
+	host.Request().Cookies.Add("choice", "yes")
+	source := `<%@ Language="JScript" %><%
+var missingForm = Request.Form("absent");
+var presentForm = Request.Form("name");
+var missingCookie = Request.Cookies("absent");
+var presentCookie = Request.Cookies("choice");
+Response.Write(missingForm.Count + ":" + (missingForm.Count === 0) + ":" + String(missingForm) + "|");
+Response.Write(presentForm.Count + ":" + String(presentForm) + "|");
+Response.Write(missingCookie.Count + ":" + (missingCookie.Count === 0) + ":" + String(missingCookie) + "|");
+Response.Write(presentCookie.Count + ":" + String(presentCookie));
+%>`
+	if got := runASPSourceForTestWithHost(t, source, host); got != "0:true:undefined|1:sample|0:true:undefined|1:yes" {
+		t.Fatalf("unexpected form and cookie item counts: %q", got)
+	}
+}
+
+func TestJScriptUnqualifiedRequestItemCountAndPrecedence(t *testing.T) {
+	host := NewMockHost()
+	host.Request().QueryString.Add("shared", "query")
+	host.Request().Form.Add("shared", "form")
+	host.Request().Form.Add("formOnly", "posted")
+	host.Request().Cookies.Add("cookieOnly", "stored")
+	source := `<%@ Language="JScript" %><%
+var missing = Request("absent");
+Response.Write(missing.Count + ":" + typeof missing.Count + ":" + (missing.Count === 0) + ":" + String(missing) + "|");
+Response.Write(Request("shared").Count + ":" + String(Request("shared")) + "|");
+Response.Write(Request("formOnly").Count + ":" + String(Request("formOnly")) + "|");
+Response.Write(Request("cookieOnly").Count + ":" + String(Request("cookieOnly")));
+%>`
+	if got := runASPSourceForTestWithHost(t, source, host); got != "0:number:true:undefined|1:query|1:posted|1:stored" {
+		t.Fatalf("unexpected unqualified request item output: %q", got)
+	}
+}
+
 func TestNormalizeJScriptCollectionAssignmentsRegexEscapedQuotes(t *testing.T) {
 	input := `
 function escapeAttr(s) {

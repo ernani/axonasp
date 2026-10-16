@@ -89,6 +89,13 @@ COPY --from=builder /build/LICENSE.txt ./LICENSE.txt
 COPY --from=builder /build/global.asa ./global.asa
 COPY --from=builder  /build/www/ ./default_www/
 
+# Fail the image build early when the ASP integration fixtures are not packaged.
+# These pages are requested by docker/integration_test.go, so their absence must
+# be reported at build time instead of at integration test time.
+RUN test -f ./default_www/tests/test_hello.asp \
+    && test -f ./default_www/tests/test_simple.asp \
+    && test -f ./default_www/tests/test_docker.asp
+
 # Create required runtime directories
 RUN mkdir -p temp/ www/ fpm/fpm.d/
 

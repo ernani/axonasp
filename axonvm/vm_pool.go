@@ -329,6 +329,7 @@ func (vm *VM) resetForReuse() {
 	vm.pooledSlot = nil
 	vm.bytecode = immutableBytecodeView(vm.baseBytecode)
 	vm.constants = immutableValueView(vm.baseConstants)
+	vm.dropDynamicCallMemberIC()
 	vm.resetGlobals()
 	vm.resetStack()
 	vm.ensureReusableMaps()
@@ -372,6 +373,7 @@ func (vm *VM) resetForReuse() {
 	vm.terminateCursor = -1
 	vm.terminatePrepared = false
 	vm.suppressTerminate = false
+	vm.pendingTerminateObjIDs = nil
 	vm.onResumeNext = false
 	vm.executeGlobalResumeGuard = false
 	vm.stmtSP = -1
@@ -402,6 +404,22 @@ func (vm *VM) resetForReuse() {
 	// Zero-fill icState for fresh execution.
 	for i := range vm.icState {
 		vm.icState[i] = InlineCacheSlot{}
+	}
+}
+
+// dropDynamicCallMemberIC discards cached member-call sites that live inside
+// runtime-appended ExecuteGlobal bytecode. Base-program sites are kept because
+// their offsets always resolve to the same member, while dynamic offsets are
+// reused by later fragments appended at the same position.
+func (vm *VM) dropDynamicCallMemberIC() {
+	if vm == nil || len(vm.callMemberIC) == 0 {
+		return
+	}
+	baseLen := len(vm.baseBytecode)
+	for site := range vm.callMemberIC {
+		if site >= baseLen {
+			delete(vm.callMemberIC, site)
+		}
 	}
 }
 
@@ -789,9 +807,6 @@ func (vm *VM) ensureDynamicMaps() {
 	if vm.jsObjectKeyOrder == nil {
 		vm.jsObjectKeyOrder = make(map[int64][]string)
 	}
-	if vm.jsObjectKeySet == nil {
-		vm.jsObjectKeySet = make(map[int64]map[string]struct{})
-	}
 	if vm.jsObjectSlots == nil {
 		vm.jsObjectSlots = make(map[int64][]Value)
 	}
@@ -1000,7 +1015,6 @@ func (vm *VM) resetDynamicMaps() {
 	clear(vm.nativeObjectProxies)
 	clear(vm.jsObjectItems)
 	clear(vm.jsObjectKeyOrder)
-	clear(vm.jsObjectKeySet)
 	clear(vm.jsObjectSlots)
 	clear(vm.jsObjectShape)
 	clear(vm.jsObjectShapeDisabled)

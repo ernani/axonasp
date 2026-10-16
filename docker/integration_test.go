@@ -25,11 +25,11 @@
 // correctly inside a Docker container (or any running instance).
 //
 // The tests target a live server whose base URL is read from the
-// TEST_SERVER_URL environment variable (default: http://localhost:4050).
+// TEST_SERVER_URL environment variable (default: http://localhost:8801).
 //
 // Run against an already-started container:
 //
-//	TEST_SERVER_URL=http://localhost:4050 go test ./docker/... -v -run TestDocker
+//	TEST_SERVER_URL=http://localhost:8801 go test ./docker/... -v -run TestDocker
 package docker
 
 import (

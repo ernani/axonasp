@@ -250,3 +250,44 @@ func TestASPIncludeVBCompileErrorMissingRHSMapsToMainLine(t *testing.T) {
 		t.Fatalf("expected actionable column at or after assignment target, got %d", syntaxErr.Column)
 	}
 }
+
+func TestASPIncludeWithoutTrailingNewlineMapsBackToMainFileLine(t *testing.T) {
+	tmpDir := t.TempDir()
+	mainPath := filepath.Join(tmpDir, "main.asp")
+
+	// Neither include ends with a newline, so the next main-file text shares their last merged line.
+	for _, name := range []string{"a.inc", "b.inc"} {
+		if err := os.WriteFile(filepath.Join(tmpDir, name), []byte("<%\nDim x_"+strings.TrimSuffix(name, ".inc")+"\n%>"), 0o600); err != nil {
+			t.Fatalf("write include failed: %v", err)
+		}
+	}
+
+	mainSource := strings.Join([]string{
+		"<!--#include file=\"a.inc\"-->",
+		"<p><!--#include file=\"b.inc\"--></p>",
+		"<%",
+		"Dim o",
+		"Response.Write o.Missing",
+		"%>",
+	}, "\n")
+	if err := os.WriteFile(mainPath, []byte(mainSource), 0o600); err != nil {
+		t.Fatalf("write main failed: %v", err)
+	}
+
+	compiler := NewASPCompiler(mainSource)
+	compiler.SetSourceName(mainPath)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+
+	vm := NewVMFromCompiler(compiler)
+	vm.SetHost(NewMockHost())
+
+	var vmErr *VMError
+	if runErr := vm.Run(); !errors.As(runErr, &vmErr) {
+		t.Fatalf("expected VMError, got %T: %v", runErr, runErr)
+	}
+	if !strings.EqualFold(filepath.Clean(vmErr.File), filepath.Clean(mainPath)) || vmErr.Line != 5 {
+		t.Fatalf("expected %s:5, got %s:%d", mainPath, vmErr.File, vmErr.Line)
+	}
+}

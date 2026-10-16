@@ -4,7 +4,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -42,7 +42,7 @@ import (
 	"unicode/utf16"
 
 	"g3pix.com.br/axonasp/v2/vbscript"
-	_ "github.com/denisenkom/go-mssqldb"
+	mssql "github.com/denisenkom/go-mssqldb"
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
 	_ "github.com/go-sql-driver/mysql"
@@ -398,6 +398,11 @@ func (vm *VM) dispatchADODBConnectionMethod(conn *adodbConnection, member string
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "OpenSchema"):
 		return vm.adodbConnectionOpenSchema(conn, args)
+	case strings.EqualFold(member, "Properties"):
+		if len(args) > 0 {
+			return vm.adodbConnectionPropertyValue(conn, args[0].String())
+		}
+		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "Errors"):
 		// Microsoft JScript permits the ADO default-property shorthand
 		// conn.Errors(index), which is compiled as a member call on Connection.
@@ -437,6 +442,49 @@ func (vm *VM) dispatchADODBConnectionPropertyGet(conn *adodbConnection, member s
 		return vm.newADODBErrorsCollection(conn)
 	}
 	return Value{Type: VTEmpty}
+}
+
+// adodbConnectionPropertyValue exposes common provider metadata through the
+// Connection.Properties(name) default-item shorthand used by Classic ASP.
+// Values requiring a live server are queried on the connection pinned by Open,
+// rather than guessed from the connection string (which may use a host alias).
+func (vm *VM) adodbConnectionPropertyValue(conn *adodbConnection, name string) Value {
+	if conn == nil || conn.state != adStateOpen || conn.dbConn == nil {
+		return Value{Type: VTEmpty}
+	}
+	var query string
+	switch conn.dbDriver {
+	case "mssql":
+		switch {
+		case strings.EqualFold(name, "DBMS Name"):
+			return NewString("Microsoft SQL Server")
+		case strings.EqualFold(name, "DBMS Version"):
+			query = "SELECT CONVERT(varchar(128), SERVERPROPERTY('ProductVersion'))"
+		case strings.EqualFold(name, "Current Catalog"):
+			query = "SELECT DB_NAME()"
+		case strings.EqualFold(name, "Server Name"):
+			query = "SELECT @@SERVERNAME"
+		}
+	case "sqlite":
+		switch {
+		case strings.EqualFold(name, "DBMS Name"):
+			return NewString("SQLite")
+		case strings.EqualFold(name, "DBMS Version"):
+			query = "SELECT sqlite_version()"
+		case strings.EqualFold(name, "Current Catalog"):
+			return NewString("main")
+		}
+	}
+	if query == "" {
+		return Value{Type: VTEmpty}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var result sql.NullString
+	if err := conn.dbConn.QueryRowContext(ctx, query).Scan(&result); err != nil || !result.Valid {
+		return Value{Type: VTEmpty}
+	}
+	return NewString(result.String)
 }
 
 func (vm *VM) dispatchADODBConnectionPropertySet(conn *adodbConnection, member string, val Value) bool {
@@ -865,6 +913,13 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "Fields.Item"):
 		if len(args) > 0 {
+			if args[0].Type == VTInteger || args[0].Type == VTDouble {
+				idx := vm.asInt(args[0])
+				if idx >= 0 && idx < len(rs.columns) {
+					return vm.newADODBFieldProxyByOrdinal(rs, idx)
+				}
+				return Value{Type: VTEmpty}
+			}
 			return vm.newADODBFieldProxy(rs, args[0].String())
 		}
 		return Value{Type: VTEmpty}
@@ -966,8 +1021,23 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 						}
 					}
 					key := vm.adodbRecordsetResolveColumnKey(rs, args[0])
+					if key == "" && (args[0].Type == VTInteger || args[0].Type == VTDouble) {
+						idx := vm.asInt(args[0])
+						if idx >= 0 && idx < len(rs.columns) {
+							key = adodbDuplicateColumnKey(idx)
+						}
+					}
 					if key != "" {
 						if len(args) > 1 {
+							if args[0].Type == VTInteger || args[0].Type == VTDouble {
+								idx := vm.asInt(args[0])
+								if rs.columnIndexByLower == nil {
+									vm.adodbRecordsetRebuildColumnIndex(rs)
+								}
+								if key != adodbDuplicateColumnKey(idx) && rs.columnIndexByLower[key] != idx {
+									key = adodbDuplicateColumnKey(idx)
+								}
+							}
 							row[key] = args[len(args)-1]
 							if rs.editMode != adEditAdd {
 								rs.editMode = adEditInProgress
@@ -989,7 +1059,7 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 		if args[0].Type == VTInteger || args[0].Type == VTDouble {
 			idx := vm.asInt(args[0])
 			if idx >= 0 && idx < len(rs.columns) {
-				return vm.newADODBFieldProxy(rs, rs.columns[idx])
+				return vm.newADODBFieldProxyByOrdinal(rs, idx)
 			}
 			return Value{Type: VTEmpty}
 		}
@@ -1409,9 +1479,8 @@ func (vm *VM) adodbRecordsetRebuildColumnIndex(rs *adodbRecordset) {
 		if key == "" {
 			continue
 		}
-		if _, exists := rs.columnIndexByLower[key]; !exists {
-			rs.columnIndexByLower[key] = idx
-		}
+		// ADO Fields.Item(name) selects the final matching field.
+		rs.columnIndexByLower[key] = idx
 	}
 }
 
@@ -1429,10 +1498,50 @@ func (vm *VM) adodbRecordsetValueByOrdinal(rs *adodbRecordset, row map[string]Va
 	if rs == nil || row == nil || index < 0 || index >= len(rs.columns) {
 		return Value{Type: VTEmpty}
 	}
-	if value, ok := row[strings.ToLower(strings.TrimSpace(rs.columns[index]))]; ok {
+	if duplicate, exists := row[adodbDuplicateColumnKey(index)]; exists {
+		return duplicate
+	}
+	key := strings.ToLower(strings.TrimSpace(rs.columns[index]))
+	// Unnamed expressions still have a value in ADO (for example SELECT 1),
+	// and older in-memory recordsets may store that value under an empty key.
+	if key == "" {
+		return row[key]
+	}
+	if rs.columnIndexByLower == nil {
+		vm.adodbRecordsetRebuildColumnIndex(rs)
+	}
+	if rs.columnIndexByLower[key] != index {
+		return Value{Type: VTEmpty}
+	}
+	if value, ok := row[key]; ok {
 		return value
 	}
 	return Value{Type: VTEmpty}
+}
+
+// adodbDuplicateColumnKey keeps earlier duplicate-name values addressable by
+// ordinal while the named key resolves to the final occurrence, as in ADO.
+func adodbDuplicateColumnKey(index int) string {
+	return "\x00" + strconv.Itoa(index)
+}
+
+func adodbStoreColumnValue(row map[string]Value, columns []string, index int, value Value) {
+	key := strings.ToLower(strings.TrimSpace(columns[index]))
+	if key == "" {
+		row[adodbDuplicateColumnKey(index)] = value
+		return
+	}
+	if previousValue, exists := row[key]; exists {
+		// When another occurrence arrives, move the previous value to its
+		// ordinal slot and let the named key point to the latest occurrence.
+		for previous := index - 1; previous >= 0; previous-- {
+			if strings.EqualFold(strings.TrimSpace(columns[previous]), key) {
+				row[adodbDuplicateColumnKey(previous)] = previousValue
+				break
+			}
+		}
+	}
+	row[key] = value
 }
 
 // adodbRecordsetClearPendingUpdateFields resets tracked changed columns for one recordset edit cycle.
@@ -1564,8 +1673,12 @@ func (vm *VM) adodbRecordsetLoadCurrentSQLResultSet(rs *adodbRecordset) {
 		}
 
 		rowMap := make(map[string]Value, len(cols))
-		for i, col := range cols {
-			rowMap[strings.ToLower(col)] = vm.adodbValueToVMValue(rowValues[i])
+		for i := range cols {
+			value := rowValues[i]
+			if i < len(rs.columnTypes) && rs.columnTypes[i] == "UNIQUEIDENTIFIER" {
+				value = adodbSQLServerGUIDText(value)
+			}
+			adodbStoreColumnValue(rowMap, cols, i, vm.adodbValueToVMValue(value))
 		}
 		rs.data = append(rs.data, rowMap)
 	}
@@ -2143,7 +2256,7 @@ func (vm *VM) adodbRecordsetGetRows(rs *adodbRecordset, args []Value) Value {
 	for c := range cols {
 		rowArray := NewVBArray(0, rows)
 		for r := range rows {
-			rowArray.Values[r] = rs.data[r][strings.ToLower(rs.columns[c])]
+			rowArray.Values[r] = vm.adodbRecordsetValueByOrdinal(rs, rs.data[r], c)
 		}
 		colArray.Values[c] = Value{Type: VTArray, Arr: rowArray}
 	}
@@ -2159,7 +2272,7 @@ func (vm *VM) adodbRecordsetGetString(rs *adodbRecordset, args []Value) Value {
 	for r := 0; r < rs.recordCount; r++ {
 		row := rs.data[r]
 		for c := 0; c < len(rs.columns); c++ {
-			sb.WriteString(row[strings.ToLower(rs.columns[c])].String())
+			sb.WriteString(vm.adodbRecordsetValueByOrdinal(rs, row, c).String())
 			if c < len(rs.columns)-1 {
 				sb.WriteString("\t")
 			}
@@ -2462,7 +2575,7 @@ func (vm *VM) dispatchADODBFieldsCollectionMethod(objID int64, member string, ar
 			if args[0].Type == VTInteger {
 				idx := int(args[0].Num)
 				if idx >= 0 && idx < len(rs.columns) {
-					return vm.newADODBFieldProxy(rs, rs.columns[idx]), true
+					return vm.newADODBFieldProxyByOrdinal(rs, idx), true
 				}
 				return Value{Type: VTEmpty}, true
 			}
@@ -2555,6 +2668,39 @@ func (vm *VM) newADODBFieldProxy(rs *adodbRecordset, name string) Value {
 	lowerName := strings.ToLower(strings.TrimSpace(name))
 	vm.adodbFieldItems[objID] = &adodbFieldProxy{rs: rs, name: name, cachedLowerName: lowerName}
 	return Value{Type: VTNativeObject, Num: objID}
+}
+
+func (vm *VM) newADODBFieldProxyByOrdinal(rs *adodbRecordset, index int) Value {
+	field := vm.newADODBFieldProxy(rs, rs.columns[index])
+	key := strings.ToLower(strings.TrimSpace(rs.columns[index]))
+	if key == "" {
+		ordinalKey := adodbDuplicateColumnKey(index)
+		vm.adodbFieldItems[field.Num].cachedLowerName = ordinalKey
+		// Providers expose SELECT 1 with an empty Field.Name. Metadata is
+		// recorded under that empty name; preserve it for ordinal field access.
+		if fieldType, ok := rs.columnTypeByName[key]; ok {
+			rs.columnTypeByName[ordinalKey] = fieldType
+		} else if index < len(rs.columnTypes) {
+			rs.columnTypeByName[ordinalKey] = adodbTypeFromDatabaseType(rs.columnTypes[index])
+		}
+		if size, ok := rs.columnSizeByName[key]; ok {
+			rs.columnSizeByName[ordinalKey] = size
+		}
+		if attributes, ok := rs.columnAttrByName[key]; ok {
+			rs.columnAttrByName[ordinalKey] = attributes
+		}
+		if scale, ok := rs.columnScaleByName[key]; ok {
+			rs.columnScaleByName[ordinalKey] = scale
+		}
+		return field
+	}
+	if rs.columnIndexByLower == nil {
+		vm.adodbRecordsetRebuildColumnIndex(rs)
+	}
+	if rs.columnIndexByLower[key] != index {
+		vm.adodbFieldItems[field.Num].cachedLowerName = adodbDuplicateColumnKey(index)
+	}
+	return field
 }
 
 type adodbFieldProxy struct {
@@ -3601,9 +3747,246 @@ func (vm *VM) adodbFirstNonEmpty(values ...string) string {
 	return ""
 }
 
+// adodbIsQuery reports whether the SQL command text produces a result set, so
+// that ADODB.Connection.Execute and the Recordset source normalizer route it
+// through Query instead of Exec.
+// The classification is deliberately allocation-free: the input is only
+// whitespace-trimmed (no copy) and every keyword test is case-insensitive
+// through strings.EqualFold on a zero-copy slice, avoiding the heap string that
+// strings.ToLower would produce for every executed statement.
 func (vm *VM) adodbIsQuery(sql string) bool {
-	s := strings.ToLower(strings.TrimSpace(sql))
-	return strings.HasPrefix(s, "select") || strings.HasPrefix(s, "show") || strings.HasPrefix(s, "pragma")
+	trimmed := strings.TrimSpace(sql)
+	if trimmed == "" {
+		return false
+	}
+
+	// Skip leading comments and grouping parentheses so that wrapped statements
+	// such as "(SELECT 1)" or "/* hint */ WITH cte AS (...)" are still detected.
+	trimmed = trimmed[adodbSkipLeadingSQLNoise(trimmed):]
+	if trimmed == "" {
+		return false
+	}
+
+	// Row-returning statements.
+	if adodbHasSQLKeywordPrefix(trimmed, "select") ||
+		adodbHasSQLKeywordPrefix(trimmed, "show") ||
+		adodbHasSQLKeywordPrefix(trimmed, "pragma") ||
+		adodbHasSQLKeywordPrefix(trimmed, "with") {
+		return true
+	}
+
+	// Stored procedure calls can return result sets
+	// (SQL Server EXEC/EXECUTE, MySQL CALL).
+	if adodbHasSQLKeywordPrefix(trimmed, "exec") ||
+		adodbHasSQLKeywordPrefix(trimmed, "execute") ||
+		adodbHasSQLKeywordPrefix(trimmed, "call") {
+		return true
+	}
+
+	// DML statements only return a result set when they carry a RETURNING clause.
+	if adodbHasSQLKeywordPrefix(trimmed, "insert") ||
+		adodbHasSQLKeywordPrefix(trimmed, "update") ||
+		adodbHasSQLKeywordPrefix(trimmed, "delete") {
+		return adodbContainsReturningOutsideQuotes(trimmed)
+	}
+
+	return false
+}
+
+// adodbHasSQLKeywordPrefix reports whether sql starts with the given lowercase
+// SQL keyword followed by a valid token boundary. The comparison is
+// case-insensitive and allocation-free. The boundary check prevents bare table
+// identifiers that merely share a keyword prefix (for example "selection" or
+// "withholding") from being misclassified as queries.
+func adodbHasSQLKeywordPrefix(sql string, keyword string) bool {
+	if len(sql) < len(keyword) {
+		return false
+	}
+	if !strings.EqualFold(sql[:len(keyword)], keyword) {
+		return false
+	}
+	return adodbIsSQLWordBoundary(sql, len(keyword))
+}
+
+// adodbIsSQLWordBoundary reports whether the byte at idx terminates a SQL token.
+// An out-of-range index is treated as a boundary (start/end of statement).
+func adodbIsSQLWordBoundary(sql string, idx int) bool {
+	if idx < 0 || idx >= len(sql) {
+		return true
+	}
+	switch c := sql[idx]; {
+	case c == '_' || c == '$':
+		return false
+	case c >= 'a' && c <= 'z':
+		return false
+	case c >= 'A' && c <= 'Z':
+		return false
+	case c >= '0' && c <= '9':
+		return false
+	default:
+		return true
+	}
+}
+
+// adodbSkipLeadingSQLNoise returns the index of the first significant byte in
+// sql, skipping leading whitespace, SQL line comments (--), SQL block comments
+// (/* */) and grouping parentheses. It returns len(sql) when no significant
+// token follows. The scan is byte-oriented and performs no allocation.
+func adodbSkipLeadingSQLNoise(sql string) int {
+	i := 0
+	for i < len(sql) {
+		c := sql[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v' || c == '(':
+			i++
+		case c == '-' && i+1 < len(sql) && sql[i+1] == '-':
+			i += 2
+			for i < len(sql) && sql[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < len(sql) && sql[i+1] == '*':
+			i += 2
+			for i < len(sql) {
+				if sql[i] == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+					i += 2
+					break
+				}
+				i++
+			}
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+// adodbContainsReturningOutsideQuotes reports whether the SQL statement contains
+// the RETURNING keyword outside of string literals, quoted identifiers and
+// comments. The scanner is a single byte-oriented pass with no allocation and no
+// regex, and it understands the escapes used by the supported drivers:
+//   - single-quoted literals with ” escaping an embedded quote,
+//   - double-quoted identifiers with "" escaping an embedded quote,
+//   - backtick identifiers with “ escaping an embedded quote (MySQL),
+//   - bracket identifiers with ]] escaping an embedded bracket (SQL Server),
+//   - PostgreSQL dollar-quoted literals ($tag$ ... $tag$),
+//   - line comments (--) and block comments (/* */).
+//
+// The keyword itself must be a full token, so identifiers such as
+// "returning_code" do not trigger the detection.
+func adodbContainsReturningOutsideQuotes(sql string) bool {
+	const keyword = "returning"
+	const keywordLen = len(keyword)
+
+	i := 0
+	for i < len(sql) {
+		c := sql[i]
+
+		switch c {
+		case '\'':
+			i++
+			for i < len(sql) {
+				if sql[i] == '\'' {
+					if i+1 < len(sql) && sql[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+		case '"':
+			i++
+			for i < len(sql) {
+				if sql[i] == '"' {
+					if i+1 < len(sql) && sql[i+1] == '"' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+		case '`':
+			i++
+			for i < len(sql) {
+				if sql[i] == '`' {
+					if i+1 < len(sql) && sql[i+1] == '`' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+		case '[':
+			i++
+			for i < len(sql) {
+				if sql[i] == ']' {
+					if i+1 < len(sql) && sql[i+1] == ']' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+		case '-':
+			if i+1 < len(sql) && sql[i+1] == '-' {
+				i += 2
+				for i < len(sql) && sql[i] != '\n' {
+					i++
+				}
+				continue
+			}
+			i++
+		case '/':
+			if i+1 < len(sql) && sql[i+1] == '*' {
+				i += 2
+				for i < len(sql) {
+					if sql[i] == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+						i += 2
+						break
+					}
+					i++
+				}
+				continue
+			}
+			i++
+		case '$':
+			// PostgreSQL dollar-quoted literal: $tag$ content $tag$.
+			tagEnd := i + 1
+			for tagEnd < len(sql) && (sql[tagEnd] == '_' ||
+				sql[tagEnd] >= 'a' && sql[tagEnd] <= 'z' ||
+				sql[tagEnd] >= 'A' && sql[tagEnd] <= 'Z' ||
+				sql[tagEnd] >= '0' && sql[tagEnd] <= '9') {
+				tagEnd++
+			}
+			if tagEnd < len(sql) && sql[tagEnd] == '$' {
+				delim := sql[i : tagEnd+1]
+				if closeIdx := strings.Index(sql[tagEnd+1:], delim); closeIdx >= 0 {
+					i = tagEnd + 1 + closeIdx + len(delim)
+					continue
+				}
+			}
+			i++
+		case 'r', 'R':
+			if i+keywordLen <= len(sql) &&
+				strings.EqualFold(sql[i:i+keywordLen], keyword) &&
+				adodbIsSQLWordBoundary(sql, i-1) &&
+				adodbIsSQLWordBoundary(sql, i+keywordLen) {
+				return true
+			}
+			i++
+		default:
+			i++
+		}
+	}
+
+	return false
 }
 
 var adodbODBCProcedureCall = regexp.MustCompile(`(?is)^\s*\{\s*call\s+(.+?)\s*\}\s*$`)
@@ -3734,6 +4117,16 @@ func (vm *VM) adodbValueToVMValue(v any) Value {
 		return NewString(string(val))
 	}
 	return NewString(fmt.Sprintf("%v", v))
+}
+
+// adodbSQLServerGUIDText formats a SQL Server uniqueidentifier, which the driver returns as
+// 16 raw bytes in SQL Server's mixed-endian order, the way ADO does: "{XXXXXXXX-XXXX-...}".
+func adodbSQLServerGUIDText(v any) any {
+	var guid mssql.UniqueIdentifier
+	if guid.Scan(v) != nil {
+		return v
+	}
+	return "{" + guid.String() + "}"
 }
 
 // adodbExecuteArgs converts ADODB.Connection.Execute optional parameter payload
@@ -5327,11 +5720,7 @@ func (vm *VM) adodbHydrateRecordsetDataFromFieldMajorValues(rs *adodbRecordset, 
 		row := make(map[string]Value, fieldCount)
 		base := rowIdx * fieldCount
 		for colIdx := range fieldCount {
-			key := strings.ToLower(strings.TrimSpace(rs.columns[colIdx]))
-			if key == "" {
-				continue
-			}
-			row[key] = vm.adodbValueToVMValue(values[base+colIdx])
+			adodbStoreColumnValue(row, rs.columns, colIdx, vm.adodbValueToVMValue(values[base+colIdx]))
 		}
 		data[rowIdx] = row
 	}
@@ -5369,10 +5758,7 @@ func (vm *VM) adodbPopulateRecordsetFromOLEFieldWalk(rs *adodbRecordset, fields 
 			}
 			valRes, _ := oleutil.GetProperty(item, "Value")
 			if valRes != nil {
-				key := strings.ToLower(strings.TrimSpace(rs.columns[i]))
-				if key != "" {
-					row[key] = vm.adodbValueToVMValue(valRes.Value())
-				}
+				adodbStoreColumnValue(row, rs.columns, i, vm.adodbValueToVMValue(valRes.Value()))
 				valRes.Clear()
 			}
 			item.Release()

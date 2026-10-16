@@ -2,7 +2,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -281,6 +281,16 @@ func (s *Server) MapPath(path string) string {
 			return rootDir
 		}
 		return absRoot
+	}
+
+	// Already a physical path inside the web root (e.g. XMLDOM.load(Server.MapPath(...)) on Unix,
+	// where it also starts with "/"): return it as-is instead of prefixing the root again.
+	if filepath.IsAbs(path) {
+		if absRoot, err := filepath.Abs(rootDir); err == nil {
+			if cleaned := filepath.Clean(path); cleaned == absRoot || strings.HasPrefix(cleaned, absRoot+string(filepath.Separator)) {
+				return cleaned
+			}
+		}
 	}
 
 	normalized := strings.ReplaceAll(path, "\\", "/")

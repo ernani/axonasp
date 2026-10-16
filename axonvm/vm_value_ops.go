@@ -2,7 +2,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -65,11 +65,8 @@ func (vm *VM) coerceFloatStrict(v Value) (float64, bool) {
 	case VTBool, VTInteger, VTDate, VTNativeObject, VTBuiltin:
 		return float64(v.Num), true
 	case VTString:
-		parsed, err := strconv.ParseFloat(strings.TrimSpace(v.Str), 64)
-		if err != nil {
-			return 0, false
-		}
-		return parsed, true
+		parsed, _, ok := vbsParseNumericString(v.Str)
+		return parsed, ok
 	default:
 		return 0, false
 	}
@@ -82,11 +79,8 @@ func (vm *VM) coerceFloat(v Value) float64 {
 	case VTDouble:
 		return v.Flt
 	case VTString:
-		parsed, err := strconv.ParseFloat(strings.TrimSpace(v.Str), 64)
-		if err == nil {
-			return parsed
-		}
-		return 0
+		parsed, _, _ := vbsParseNumericString(v.Str)
+		return parsed
 	default:
 		return float64(v.Num)
 	}
@@ -107,11 +101,8 @@ func (vm *VM) coerceInt64(v Value) int64 {
 		if err == nil {
 			return parsed
 		}
-		parsedFloat, floatErr := strconv.ParseFloat(strings.TrimSpace(v.Str), 64)
-		if floatErr == nil {
-			return int64(math.RoundToEven(parsedFloat))
-		}
-		return 0
+		parsedFloat, _, _ := vbsParseNumericString(v.Str)
+		return int64(math.RoundToEven(parsedFloat))
 	default:
 		return 0
 	}
@@ -137,7 +128,7 @@ func (vm *VM) coerceLogicalInt64(v Value) (int64, bool) {
 		if parsed, err := strconv.ParseInt(text, 10, 64); err == nil {
 			return parsed, true
 		}
-		if parsedFloat, err := strconv.ParseFloat(text, 64); err == nil {
+		if parsedFloat, _, ok := vbsParseNumericString(text); ok {
 			return int64(math.RoundToEven(parsedFloat)), true
 		}
 		return 0, false // non-numeric string — raises Type mismatch

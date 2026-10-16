@@ -252,6 +252,36 @@ connection.Close();
 	}
 }
 
+func TestJScriptADODBRecordsetDuplicateNamesKeepOrdinalValues(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+var connection = Server.CreateObject("ADODB.Connection");
+connection.Open("sqlite::memory:");
+connection.Execute("CREATE TABLE left_table (id TEXT)");
+connection.Execute("CREATE TABLE right_table (id TEXT)");
+connection.Execute("INSERT INTO left_table VALUES ('left-id')");
+connection.Execute("INSERT INTO right_table VALUES ('right-id')");
+var rs = connection.Execute("SELECT a.id, b.id FROM left_table a JOIN right_table b ON 1=1");
+Response.Write(String(rs(0)) + "|" + String(rs(1)) + "|" + String(rs("id")) + "|" + String(rs.Fields("id").Value));
+connection.Close();
+%>`
+	if got := runASPSourceForTest(t, source); got != "left-id|right-id|right-id|right-id" {
+		t.Fatalf("unexpected duplicate field output: %q", got)
+	}
+}
+
+func TestJScriptADODBRecordsetUnnamedExpressionPreservesNumericValue(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+var connection = Server.CreateObject("ADODB.Connection");
+connection.Open("sqlite::memory:");
+var rs = connection.Execute("SELECT 1");
+Response.Write(String(rs(0)) + "|" + String(rs.Fields(0).Value) + "|" + (+rs.Fields.Item(0)));
+connection.Close();
+%>`
+	if got := runASPSourceForTest(t, source); got != "1|1|1" {
+		t.Fatalf("unexpected unnamed expression output: %q", got)
+	}
+}
+
 func TestJScriptSequenceAssignmentsRetainEachRecordsetFieldValue(t *testing.T) {
 	source := `<%@ Language="JScript" %><%
 var connection = Server.CreateObject("ADODB.Connection");

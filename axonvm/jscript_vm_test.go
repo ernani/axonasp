@@ -26,6 +26,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -310,13 +311,7 @@ func TestJScriptFunctionTemplateMetadataSurvivesPooledReset(t *testing.T) {
 
 	vm = AcquireVMFromCachedProgram(program)
 	defer vm.Release()
-	foundSame := false
-	for _, metadata := range vm.jsFunctionTemplateMetadataCache {
-		if metadata == cached {
-			foundSame = true
-			break
-		}
-	}
+	foundSame := slices.Contains(vm.jsFunctionTemplateMetadataCache, cached)
 	if !foundSame {
 		t.Fatal("pooled reset discarded immutable function template metadata")
 	}
@@ -2076,6 +2071,45 @@ func TestJScriptES5StringMethodsSurface(t *testing.T) {
 	out := runASPSourceForTest(t, source)
 	if out != "b|98|bcD|cDe|bcDe|AbcDefXY|123|3|abcdef|ABCDEF|-1" {
 		t.Fatalf("unexpected string ES5 methods output: %q", out)
+	}
+}
+
+func TestJScriptArrayPrototypeOverrideTakesPrecedence(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`Array.prototype.indexOf = function() { return 42; };` +
+		`Response.Write([3].indexOf("3"));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "42" {
+		t.Fatalf("array prototype override was bypassed: %q", out)
+	}
+}
+
+func TestJScriptInOperatorRecognizesArrayIndexes(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`var values = ["first", "second"];` +
+		`Response.Write((0 in values) + "|" + (1 in values) + "|" + (2 in values) + "|" + ("length" in values));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "true|true|false|true" {
+		t.Fatalf("array property membership mismatch: %q", out)
+	}
+}
+
+func TestJScriptOverriddenArrayFilterCanTestIndexes(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`Array.prototype.filter = function(callback) {` +
+		`  var result = [];` +
+		`  for (var i = 0; i < this.length; i++) {` +
+		`    if (i in this && callback(this[i], i, this)) result.push(this[i]);` +
+		`  }` +
+		`  return result;` +
+		`};` +
+		`Response.Write([1,2,3].filter(function(value) { return value > 1; }).join(","));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "2,3" {
+		t.Fatalf("overridden array filter skipped populated indexes: %q", out)
 	}
 }
 

@@ -65,7 +65,7 @@ func TestJScriptObjectShapeTransitionsSurvivePooledReset(t *testing.T) {
 
 func TestJScriptObjectShapeCacheIsBounded(t *testing.T) {
 	vm := NewVM(nil, nil, 0)
-	for i := 0; i < jsObjectShapeCacheLimit+1; i++ {
+	for i := range jsObjectShapeCacheLimit + 1 {
 		id := vm.allocJSID()
 		vm.jsObjectItems[id] = make(map[string]Value)
 		vm.jsObjectShape[id] = 0
@@ -141,7 +141,8 @@ func TestJScriptLargeObjectStopsTrackingShapeTransitions(t *testing.T) {
 	if _, disabled := vm.jsObjectShapeDisabled[id]; !disabled {
 		t.Fatal("large object was not marked as permanently unshaped")
 	}
-	if got := vm.jsObjectItems[id]["key_256"]; got.Type != VTInteger || got.Num != 256 {
+	lastKey := "key_" + strconv.Itoa(jsObjectShapePropertyLimit)
+	if got := vm.jsObjectItems[id][lastKey]; got.Type != VTInteger || got.Num != int64(jsObjectShapePropertyLimit) {
 		t.Fatalf("large object lost property value: %#v", got)
 	}
 	transitionCount := len(vm.jsShapeTransitions)

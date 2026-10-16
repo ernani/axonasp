@@ -4,7 +4,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas GuimarÃ£es - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -61,6 +61,7 @@ var (
 	Version                       = "0.0.0.0"
 	Port                          = "8801"
 	RootDir                       = "./www"
+	VirtualAppPath                = ""
 	EnableWebConfig               = true
 	EnableDirectoryListing        = false
 	ExposeServerHeaders           = true
@@ -165,6 +166,12 @@ func loadServerConfig() {
 	}
 	if rootDir := strings.TrimSpace(v.GetString("server.web_root")); rootDir != "" {
 		RootDir = rootDir
+	}
+	if alias := strings.TrimSpace(v.GetString("server.virtual_app_path")); alias != "" {
+		if !validVirtualAppPath(alias) {
+			log.Fatalf("invalid server.virtual_app_path %q: expected one URL path segment", alias)
+		}
+		VirtualAppPath = alias
 	}
 	if pages := v.GetStringSlice("server.default_pages"); len(pages) > 0 {
 		DefaultPages = pages
@@ -501,17 +508,41 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "/"
 	}
+	if VirtualAppPath != "" {
+		if path == VirtualAppPath {
+			redirectPath := VirtualAppPath + "/"
+			if r.URL.RawQuery != "" {
+				redirectPath += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, redirectPath, http.StatusMovedPermanently)
+			return
+		}
+		if !strings.HasPrefix(path, VirtualAppPath+"/") {
+			serveErrorPage(w, r, http.StatusNotFound)
+			return
+		}
+		path = strings.TrimPrefix(path, VirtualAppPath)
+		// Resolve filesystem paths without the alias; retain it in request metadata.
+	}
 
 	if activeWebConfig != nil {
 		result, ok := activeWebConfig.Apply(path, r.URL.RawQuery)
 		if ok {
 			switch result.ActionType {
 			case "redirect":
-				http.Redirect(w, r, result.RedirectLocation, result.RedirectStatus)
+				redirectLocation := result.RedirectLocation
+				if VirtualAppPath != "" && strings.HasPrefix(redirectLocation, "/") && !strings.HasPrefix(redirectLocation, "//") {
+					redirectLocation = VirtualAppPath + redirectLocation
+				}
+				http.Redirect(w, r, redirectLocation, result.RedirectStatus)
 				return
 			case "rewrite":
 				path = result.Path
-				r.URL.Path = result.Path
+				if VirtualAppPath != "" {
+					r.URL.Path = VirtualAppPath + result.Path
+				} else {
+					r.URL.Path = result.Path
+				}
 				r.URL.RawQuery = result.RawQuery
 			}
 		}
@@ -557,7 +588,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	if info.IsDir() {
 		if !strings.HasSuffix(path, "/") {
-			redirectPath := path + "/"
+			redirectPath := r.URL.Path + "/"
 			if r.URL.RawQuery != "" {
 				redirectPath += "?" + r.URL.RawQuery
 			}

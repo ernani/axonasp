@@ -124,7 +124,12 @@ type jsRegExpCacheEntry struct {
 }
 
 const jsRegExpProgramCacheLimit = 1024
-const jsObjectShapePropertyLimit = 256
+
+// Shapes copy their accumulated property-name layout when a transition is first
+// observed. Keep the limit low enough that dictionary-like objects do not turn
+// this into quadratic retained metadata; small fixed-layout objects still get
+// the inline-cache fast path.
+const jsObjectShapePropertyLimit = 32
 const jsObjectShapeCacheLimit = 4096
 const jsEnvBindingsPoolLimit = 128
 const jsEnvBindingsPoolMaxEntries = 32
@@ -142,20 +147,21 @@ type jsDefinePropertySpec struct {
 }
 
 type jsFunctionObject struct {
-	name       string
-	source     string
-	params     []string
-	restParam  string
-	localCount int
-	localNames []string
-	startIP    int
-	endIP      int
-	envID      int64
-	protoID    int64
-	isBound    bool
-	boundFn    Value
-	boundThis  Value
-	boundArgs  []Value
+	name                 string
+	source               string
+	params               []string
+	restParam            string
+	localCount           int
+	localNames           []string
+	startIP              int
+	endIP                int
+	envID                int64
+	protoID              int64
+	prototypeInitialized bool
+	isBound              bool
+	boundFn              Value
+	boundThis            Value
+	boundArgs            []Value
 	// isArrow marks this as an ES6 arrow function that captures 'this' lexically.
 	// When true, capturedThis is used as the receiver regardless of call site.
 	isArrow                 bool
@@ -1008,24 +1014,9 @@ func (vm *VM) jsTrackObjectKey(objID int64, key string) {
 	if strings.HasPrefix(key, jsInternalPropPrefix) {
 		return
 	}
-	if vm.jsObjectKeySet == nil {
-		vm.jsObjectKeySet = make(map[int64]map[string]struct{})
-	}
-	// O(1) membership test preserves insertion order without rescanning the
-	// whole key-order slice on every new property (avoids O(N^2) growth when a
-	// single object accumulates many distinct keys).
-	seen := vm.jsObjectKeySet[objID]
-	if seen == nil {
-		seen = make(map[string]struct{}, len(vm.jsObjectKeyOrder[objID])+4)
-		for _, k := range vm.jsObjectKeyOrder[objID] {
-			seen[k] = struct{}{}
-		}
-		vm.jsObjectKeySet[objID] = seen
-	}
-	if _, ok := seen[key]; ok {
-		return
-	}
-	seen[key] = struct{}{}
+	// Callers determine whether the property is new from the canonical value
+	// and descriptor maps. A second per-object membership map duplicated every
+	// key and was particularly expensive for short-lived objects.
 	vm.jsObjectKeyOrder[objID] = append(vm.jsObjectKeyOrder[objID], key)
 }
 
@@ -1037,9 +1028,6 @@ func (vm *VM) jsUntrackObjectKey(objID int64, key string) {
 	for i, k := range order {
 		if k == key {
 			vm.jsObjectKeyOrder[objID] = append(order[:i], order[i+1:]...)
-			if seen, ok := vm.jsObjectKeySet[objID]; ok {
-				delete(seen, key)
-			}
 			return
 		}
 	}
@@ -1592,6 +1580,16 @@ func (vm *VM) jsGetDescriptor(objID int64, key string) (jsPropertyDescriptor, bo
 			return d, true
 		}
 	}
+	if key == "prototype" {
+		if fn := vm.jsFunctionItems[objID]; fn != nil && !fn.prototypeInitialized {
+			vm.jsEnsureFunctionPrototype(Value{Type: VTJSFunction, Num: objID})
+			if props := vm.jsPropertyItems[objID]; props != nil {
+				if desc, exists := props[key]; exists {
+					return desc, true
+				}
+			}
+		}
+	}
 	obj, ok := vm.jsObjectItems[objID]
 	if !ok {
 		return jsPropertyDescriptor{}, false
@@ -1613,8 +1611,8 @@ func (vm *VM) jsSetDescriptor(objID int64, key string, desc jsPropertyDescriptor
 	obj := vm.jsObjectItems[objID]
 	props := vm.jsPropertyItems[objID]
 	_, descriptorExists := props[key]
-	_, propertyTracked := vm.jsObjectKeySet[objID][key]
-	propertyExists := propertyTracked || descriptorExists
+	_, valueExists := obj[key]
+	propertyExists := valueExists || descriptorExists
 	defaultData := desc.HasValue && !desc.HasGetter && !desc.HasSetter && desc.Enumerable && desc.Configurable && desc.Writable
 
 	if defaultData {
@@ -1648,7 +1646,6 @@ func (vm *VM) jsCreatePrototypeObject(owner Value) Value {
 	protoID := vm.allocJSID()
 	vm.jsObjectItems[protoID] = make(map[string]Value, 2)
 	vm.jsObjectKeyOrder[protoID] = make([]string, 0, 2)
-	vm.jsPropertyItems[protoID] = make(map[string]jsPropertyDescriptor, 2)
 	vm.jsSetDescriptor(protoID, "constructor", jsPropertyDescriptor{
 		Value:        owner,
 		HasValue:     true,
@@ -1856,7 +1853,7 @@ func (vm *VM) jsFromGoJSON(payload any) Value {
 		for key, item := range v {
 			val := vm.jsFromGoJSON(item)
 			obj[key] = val
-			vm.jsTrackObjectKey(objID, key)
+			vm.jsObjectKeyOrder[objID] = append(vm.jsObjectKeyOrder[objID], key)
 		}
 		vm.jsObjectItems[objID] = obj
 		props := vm.jsEnsurePropertyMap(objID)
@@ -3523,25 +3520,24 @@ func (vm *VM) jsCreateClosure(templateIdx uint16) Value {
 	}
 	id := vm.allocJSID()
 	fnVal := Value{Type: VTJSFunction, Num: id}
-	proto := vm.jsCreatePrototypeObject(fnVal)
 	metadata := vm.jsFunctionTemplateMetadata(templateIdx, template)
 	fnObj := &jsFunctionObject{
-		name:               template.Str,
-		source:             metadata.source,
-		params:             metadata.params,
-		restParam:          metadata.restParam,
-		localCount:         metadata.localCount,
-		localNames:         metadata.localNames,
-		startIP:            int(template.Num),
-		endIP:              int(template.Flt),
-		envID:              vm.jsActiveEnvID,
-		protoID:            proto.Num,
-		isClassConstructor: metadata.isClassConstructor,
-		isStrict:           metadata.isStrict,
-		isDerived:          metadata.isDerived,
-		isAsync:            metadata.isAsync,
-		isGenerator:        metadata.isGenerator,
-		usesArguments:      metadata.usesArguments,
+		name:                 template.Str,
+		source:               metadata.source,
+		params:               metadata.params,
+		restParam:            metadata.restParam,
+		localCount:           metadata.localCount,
+		localNames:           metadata.localNames,
+		startIP:              int(template.Num),
+		endIP:                int(template.Flt),
+		envID:                vm.jsActiveEnvID,
+		prototypeInitialized: metadata.isAsync || template.Type == VTJSArrowFunctionTemplate,
+		isClassConstructor:   metadata.isClassConstructor,
+		isStrict:             metadata.isStrict,
+		isDerived:            metadata.isDerived,
+		isAsync:              metadata.isAsync,
+		isGenerator:          metadata.isGenerator,
+		usesArguments:        metadata.usesArguments,
 	}
 	if vm.jsBlockScopeDepth > 0 {
 		activeDepth := min(min(min(vm.jsBlockScopeDepth, len(vm.jsBlockScopes)), len(vm.jsBlockScopeConst)), len(vm.jsBlockScopeTDZ))
@@ -3563,15 +3559,31 @@ func (vm *VM) jsCreateClosure(templateIdx uint16) Value {
 		}
 	}
 	vm.jsObjectItems[id] = make(map[string]Value, 2)
-	vm.jsPropertyItems[id] = make(map[string]jsPropertyDescriptor, 2)
-	vm.jsSetDescriptor(id, "prototype", jsPropertyDescriptor{
+	return fnVal
+}
+
+func (vm *VM) jsEnsureFunctionPrototype(fnVal Value) Value {
+	if fnVal.Type != VTJSFunction {
+		return Value{Type: VTJSUndefined}
+	}
+	fn := vm.jsFunctionItems[fnVal.Num]
+	if fn == nil || fn.prototypeInitialized {
+		if fn != nil && fn.protoID != 0 {
+			return Value{Type: VTJSObject, Num: fn.protoID}
+		}
+		return Value{Type: VTJSUndefined}
+	}
+	fn.prototypeInitialized = true
+	proto := vm.jsCreatePrototypeObject(fnVal)
+	fn.protoID = proto.Num
+	vm.jsSetDescriptor(fnVal.Num, "prototype", jsPropertyDescriptor{
 		Value:        proto,
 		HasValue:     true,
 		Enumerable:   false,
 		Configurable: false,
 		Writable:     true,
 	})
-	return fnVal
+	return proto
 }
 
 func (vm *VM) jsPrepareLocalFrame(localCount int, savedSP int) bool {
@@ -5815,6 +5827,11 @@ func (vm *VM) jsPrepareMemberCallee(target Value, member string) (Value, Value, 
 	if !vm.jsIsCallable(callee) {
 		return Value{Type: VTJSUndefined}, Value{Type: VTJSUndefined}, false, false
 	}
+	// Synthetic prototype methods dispatch back through jsCallMember. Let that
+	// path handle native functions while user-defined replacements run normally.
+	if callee.Type == VTJSFunction && vm.jsFunctionItems[callee.Num] == nil {
+		return Value{Type: VTJSUndefined}, Value{Type: VTJSUndefined}, false, false
+	}
 	return callee, target, true, false
 }
 
@@ -5841,7 +5858,6 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			}
 		}
 	}
-
 	if target.Type == VTJSFunction {
 		switch {
 		case strings.EqualFold(member, "toString"), strings.EqualFold(member, "toLocaleString"):
@@ -6338,9 +6354,9 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 		}
 	case VTString:
 		text := target.Str
-		runes := []rune(text)
 		switch {
 		case strings.EqualFold(member, "charAt"):
+			runes := []rune(text)
 			idx := int(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)
 			if idx < 0 || idx >= len(runes) {
 				return NewString(""), true
@@ -6351,6 +6367,7 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			}
 			return NewString(ch), true
 		case strings.EqualFold(member, "at"):
+			runes := []rune(text)
 			length := len(runes)
 			idx := 0
 			if len(args) > 0 {
@@ -6368,12 +6385,14 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			}
 			return NewString(ch), true
 		case strings.EqualFold(member, "charCodeAt"):
+			runes := []rune(text)
 			idx := int(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)
 			if idx < 0 || idx >= len(runes) {
 				return NewDouble(math.NaN()), true
 			}
 			return NewInteger(int64(runes[idx])), true
 		case strings.EqualFold(member, "codePointAt"):
+			runes := []rune(text)
 			position := vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt
 			if math.IsNaN(position) {
 				position = 0
@@ -6404,6 +6423,7 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			}
 			return NewInteger(int64(first)), true
 		case strings.EqualFold(member, "substring"):
+			runes := []rune(text)
 			start := jsClampIndex(int(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt), len(runes))
 			end := len(runes)
 			if len(args) > 1 && args[1].Type != VTJSUndefined {
@@ -6418,6 +6438,7 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			}
 			return NewString(out), true
 		case strings.EqualFold(member, "substr"):
+			runes := []rune(text)
 			start := int(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)
 			if start < 0 {
 				start = max(len(runes)+start, 0)
@@ -6436,6 +6457,7 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			}
 			return NewString(out), true
 		case strings.EqualFold(member, "slice"):
+			runes := []rune(text)
 			start := jsNormalizeRelativeIndex(int(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt), len(runes))
 			end := len(runes)
 			if len(args) > 1 && args[1].Type != VTJSUndefined {
@@ -6527,6 +6549,7 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			if len(args) == 0 {
 				return NewInteger(-1), true
 			}
+			runes := []rune(text)
 			search := vm.valueToString(args[0])
 			searchRunes := []rune(search)
 			searchLen := len(searchRunes)
@@ -11577,7 +11600,6 @@ func (vm *VM) jsConstruct(constructor Value, args []Value, newTarget Value, isSu
 
 			instanceID := vm.allocJSID()
 			vm.jsObjectItems[instanceID] = make(map[string]Value, 8)
-			vm.jsPropertyItems[instanceID] = make(map[string]jsPropertyDescriptor, 8)
 			instance := Value{Type: VTJSObject, Num: instanceID}
 			// Use prototype from newTarget (which might be the subclass if this is a base constructor call via super())
 			proto, deferred := vm.jsMemberGet(newTarget, "prototype")

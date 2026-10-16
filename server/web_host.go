@@ -87,7 +87,11 @@ func NewWebHost(w http.ResponseWriter, r *http.Request) *WebHost {
 	host.request.SetHTTPRequest(r)
 	host.server.SetRootDir(RootDir)
 	host.server.SetUnrestrictedFS(AllowExternalFilesystemAccess)
-	host.server.SetRequestPath(r.URL.Path)
+	requestPath := r.URL.Path
+	if VirtualAppPath != "" && strings.HasPrefix(requestPath, VirtualAppPath+"/") {
+		requestPath = strings.TrimPrefix(requestPath, VirtualAppPath)
+	}
+	host.server.SetRequestPath(requestPath)
 	_ = host.server.SetScriptTimeout(ScriptTimeout)
 
 	// Populate Request object
@@ -142,13 +146,12 @@ func NewWebHost(w http.ResponseWriter, r *http.Request) *WebHost {
 	host.request.ServerVars.Add("SERVER_PROTOCOL", r.Proto)
 	host.request.ServerVars.Add("REQUEST_URI", requestURI)
 	host.request.ServerVars.Add("PATH_INFO", r.URL.Path)
-	host.request.ServerVars.Add("PATH_TRANSLATED", host.server.MapPath(r.URL.Path))
+	host.request.ServerVars.Add("PATH_TRANSLATED", host.server.MapPath(requestPath))
 	host.request.ServerVars.Add("APPL_PHYSICAL_PATH", host.server.MapPath("/"))
-	// Classic ASP applications derive their virtual application name from IIS
-	// metadata.  Supplying the equivalent root values prevents getAppPath()
-	// from producing "//" cookie paths (which browsers may reject).
-	host.request.ServerVars.Add("APPL_MD_PATH", "/LM/W3SVC/1/ROOT")
-	host.request.ServerVars.Add("INSTANCE_META_PATH", "/LM/W3SVC/1/ROOT")
+	// Match IIS virtual-application metadata when an alias is configured.
+	appMetadata, instanceMetadata := virtualAppMetadata(VirtualAppPath)
+	host.request.ServerVars.Add("APPL_MD_PATH", appMetadata)
+	host.request.ServerVars.Add("INSTANCE_META_PATH", instanceMetadata)
 	host.request.ServerVars.Add("REMOTE_ADDR", requestRemoteAddr(r.RemoteAddr))
 	host.request.ServerVars.Add("REQUEST_METHOD", r.Method)
 	host.request.ServerVars.Add("SERVER_NAME", hostName)
@@ -298,7 +301,7 @@ func (h *WebHost) setSessionCookie() {
 	http.SetCookie(writer, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    h.session.ID,
-		Path:     "/",
+		Path:     virtualAppCookiePath(VirtualAppPath),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})

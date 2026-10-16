@@ -142,6 +142,64 @@ func TestADODBOLEHydrateFieldMajorValues(t *testing.T) {
 	}
 }
 
+func TestADODBOLEHydrateDuplicateFieldNamesPreservesOrdinalsAndLastNamedValue(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	rs := &adodbRecordset{columns: []string{"Id", "Label", "ID", "iD"}}
+	values := []any{"first", "text", "second", nil}
+	if !vm.adodbHydrateRecordsetDataFromFieldMajorValues(rs, values, 4, 1) {
+		t.Fatal("expected hydration success")
+	}
+	if got := rs.data[0]["id"]; got.Type != VTNull {
+		t.Fatalf("named field did not resolve to the final null: %#v", got)
+	}
+	vm.adodbRecordsetRebuildColumnIndex(rs)
+	if got := vm.adodbRecordsetValueByOrdinal(rs, rs.data[0], 0); got.Type != VTString || got.Str != "first" {
+		t.Fatalf("first field lost its ordinal value: %#v", got)
+	}
+	if got := vm.adodbRecordsetValueByOrdinal(rs, rs.data[0], 2); got.Type != VTString || got.Str != "second" {
+		t.Fatalf("duplicate field lost its ordinal value: %#v", got)
+	}
+	rs.state = adStateOpen
+	rs.currentRow = 0
+	first := vm.newADODBFieldProxyByOrdinal(rs, 0)
+	second := vm.newADODBFieldProxyByOrdinal(rs, 2)
+	last := vm.newADODBFieldProxy(rs, "id")
+	for _, tc := range []struct {
+		field Value
+		want  string
+	}{{first, "first"}, {second, "second"}} {
+		got, ok := vm.dispatchADODBFieldPropertyGet(tc.field.Num, "Value")
+		if !ok || got.Type != VTString || got.Str != tc.want {
+			t.Fatalf("field lookup: got %#v, ok %t; want %q", got, ok, tc.want)
+		}
+	}
+	if got, ok := vm.dispatchADODBFieldPropertyGet(last.Num, "Value"); !ok || got.Type != VTNull {
+		t.Fatalf("named field lookup: got %#v, ok %t; want null", got, ok)
+	}
+}
+
+func TestADODBOLEHydrateUnnamedColumnsByOrdinal(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	rs := &adodbRecordset{columns: []string{"", "", "ID"}}
+	if !vm.adodbHydrateRecordsetDataFromFieldMajorValues(rs, []any{int32(1), int32(2), "third"}, 3, 1) {
+		t.Fatal("expected hydration success")
+	}
+	vm.adodbRecordsetRebuildColumnIndex(rs)
+	rs.columnTypeByName = map[string]int{"": 3}
+	for index, want := range []int64{1, 2} {
+		if got := vm.adodbRecordsetValueByOrdinal(rs, rs.data[0], index); got.Type != VTInteger || got.Num != want {
+			t.Fatalf("unnamed field %d = %#v, want %d", index, got, want)
+		}
+		field := vm.newADODBFieldProxyByOrdinal(rs, index)
+		if rs.data[0][vm.adodbFieldItems[field.Num].cachedLowerName].Num != want {
+			t.Fatalf("unnamed field proxy %d lost its value", index)
+		}
+		if got, ok := vm.dispatchADODBFieldPropertyGet(field.Num, "Type"); !ok || got.Num != 3 {
+			t.Fatalf("unnamed field proxy %d type = %#v, ok %t; want 3", index, got, ok)
+		}
+	}
+}
+
 func TestADODBOLEHydrateFieldMajorValuesRejectsShortPayload(t *testing.T) {
 	vm := NewVM(nil, nil, 5)
 	rs := &adodbRecordset{columns: []string{"Id", "Name"}}

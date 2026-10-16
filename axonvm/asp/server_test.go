@@ -2,7 +2,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas GuimarÃ£es - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -61,6 +61,11 @@ func TestServerMapPath(t *testing.T) {
 	relative := server.MapPath("local.asp")
 	if !strings.HasSuffix(strings.ReplaceAll(relative, "\\", "/"), "/www/folder/local.asp") {
 		t.Fatalf("unexpected relative map path: %s", relative)
+	}
+
+	// Mapping an already-mapped path is a no-op (XMLDOM.load(Server.MapPath(...)) on Unix).
+	if again := server.MapPath(relative); again != relative {
+		t.Fatalf("re-mapping %s gave %s", relative, again)
 	}
 }
 
