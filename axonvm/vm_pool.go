@@ -373,6 +373,7 @@ func (vm *VM) resetForReuse() {
 	vm.terminateCursor = -1
 	vm.terminatePrepared = false
 	vm.suppressTerminate = false
+	vm.pendingTerminateObjIDs = nil
 	vm.onResumeNext = false
 	vm.executeGlobalResumeGuard = false
 	vm.stmtSP = -1
