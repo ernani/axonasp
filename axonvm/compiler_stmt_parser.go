@@ -227,12 +227,17 @@ func (c *Compiler) parseStatement() {
 			name := c.expectIdentifier()
 
 			if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctLParen {
-				op, idx := c.resolveVar(name)
-				c.emit(op, idx)
+				if strings.EqualFold(name, "Me") && c.currentClassName != "" {
+					c.emit(OpMe)
+				} else {
+					op, idx := c.resolveVar(name)
+					c.emit(op, idx)
+				}
 				argCount := c.parseParenArgumentList()
 				if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctEqual {
 					c.move()
 					c.parseExpression(PrecNone)
+					c.undoTrailingCoerce()
 					midx := c.addConstant(NewString(""))
 					c.emit(OpArraySet, midx, argCount)
 					return
@@ -246,8 +251,12 @@ func (c *Compiler) parseStatement() {
 			}
 
 			if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctDot {
-				op, idx := c.resolveVar(name)
-				c.emit(op, idx)
+				if strings.EqualFold(name, "Me") && c.currentClassName != "" {
+					c.emit(OpMe)
+				} else {
+					op, idx := c.resolveVar(name)
+					c.emit(op, idx)
+				}
 				c.parseSetMemberAssignmentChain()
 				return
 			}
@@ -1134,6 +1143,13 @@ func (c *Compiler) parseSetMemberAssignmentChain() {
 		}
 
 		if hasCall {
+			if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctEqual {
+				c.move()
+				c.parseExpression(PrecNone)
+				c.undoTrailingCoerce()
+				c.emit(OpArraySet, midx, argCount)
+				return
+			}
 			panic(c.vbCompileError(vbscript.SyntaxError, "Expected member name after indexed call target in Set assignment"))
 		}
 
