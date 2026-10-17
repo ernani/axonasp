@@ -1789,6 +1789,12 @@ func (vm *VM) syncExecuteGlobalState(child *VM) {
 	vm.runtimeClasses = child.runtimeClasses
 	vm.runtimeClassItems = child.runtimeClassItems
 	vm.classInstanceOrder = child.classInstanceOrder
+	// Forward Class_Terminate invocations that the child queued after its execution loop
+	// had already stopped, so the parent drains them at the next instruction boundary
+	// instead of leaving the instance terminated without its destructor body running.
+	for _, pendingObjID := range child.pendingTerminateObjIDs {
+		vm.enqueuePendingTerminate(pendingObjID)
+	}
 	vm.responseCookieItems = child.responseCookieItems
 	vm.requestCollectionValueItems = child.requestCollectionValueItems
 	vm.aspErrorItems = child.aspErrorItems
@@ -2114,6 +2120,13 @@ aspExecLoop:
 
 		switch op {
 		case OpHalt:
+			// Program termination must leave vm.ip at the end of the active bytecode even
+			// when dynamic Eval/Execute fragments were appended after the main program's
+			// OpHalt. End-of-request cleanup (prepareClassTerminateCall and the pending
+			// terminate drain) captures vm.ip as the returnIP of the termination frames, so
+			// a stale ip < len(vm.bytecode) would resume execution inside an orphaned
+			// dynamic fragment with an empty call stack instead of exiting the loop.
+			vm.ip = len(vm.bytecode)
 			vm.jsDrainNodeAsyncOnExit()
 			break aspExecLoop
 
@@ -5923,6 +5936,12 @@ aspExecLoop:
 	// objects go away in reference-count order instead of waiting for the end-of-page sweep.
 	if len(vm.pendingTerminateObjIDs) > 0 {
 		vm.flushPendingTerminates()
+		// End-of-request terminations must return past the end of bytecode: vm.ip is only
+		// meaningful while a script fragment is still executing, and appended dynamic
+		// Eval/Execute fragments make vm.ip < len(vm.bytecode) after the main program ends.
+		if len(vm.callStack) > 0 {
+			vm.callStack[len(vm.callStack)-1].returnIP = len(vm.bytecode)
+		}
 		if vm.ip < len(vm.bytecode) {
 			goto aspExecLoop
 		}
@@ -6042,6 +6061,11 @@ func (vm *VM) prepareClassTerminateCall() bool {
 		if vm.beginUserSubCall(target, nil, true, instanceID) {
 			if len(vm.callStack) > 0 {
 				vm.callStack[len(vm.callStack)-1].terminateObjID = instanceID
+				// End-of-request cleanup runs after the main program already terminated, so
+				// the termination frame must return past the end of bytecode. Returning to
+				// the captured vm.ip would re-enter the appended dynamic Eval/Execute
+				// fragment that sits after the main program's OpHalt.
+				vm.callStack[len(vm.callStack)-1].returnIP = len(vm.bytecode)
 			}
 			return true
 		}
@@ -9500,9 +9524,12 @@ func (vm *VM) decrementObjectRefCountEx(obj Value, isReturnValue bool) {
 		return // Do not terminate or nullify Members when this object is the active return value being passed to caller.
 	}
 	if vm.suppressTerminate {
-		// Suppressed scopes (ExecuteGlobal/Eval children) never start Class_Terminate,
-		// so member release can run inline without touching the call frames.
-		vm.terminateObjectInstance(obj.Num)
+		// Suppressed scopes (ExecuteGlobal/Eval children) still have to run the
+		// Class_Terminate body of an object that reaches reference count zero, otherwise
+		// the instance would be marked terminated without ever executing its destructor.
+		// Queue it like any other scope: the child executes the body at the next
+		// instruction boundary, where starting a call frame is safe.
+		vm.enqueuePendingTerminate(obj.Num)
 		return
 	}
 	vm.enqueuePendingTerminate(obj.Num)
@@ -9561,23 +9588,21 @@ func (vm *VM) terminateObjectInstance(objID int64) bool {
 	}
 	instance.terminated = true
 
-	if !vm.suppressTerminate {
-		target, ok := vm.resolveRuntimeClassMethod(
-			Value{Type: VTObject, Num: objID, Str: instance.ClassName},
-			"Class_Terminate",
-			false,
-		)
-		if ok {
-			if target.UserSubParamCount() != 0 {
-				vm.raise(vbscript.ClassInitializeOrTerminateDoNotHaveArguments, "Class_Terminate must not declare arguments")
-				return false
+	target, ok := vm.resolveRuntimeClassMethod(
+		Value{Type: VTObject, Num: objID, Str: instance.ClassName},
+		"Class_Terminate",
+		false,
+	)
+	if ok {
+		if target.UserSubParamCount() != 0 {
+			vm.raise(vbscript.ClassInitializeOrTerminateDoNotHaveArguments, "Class_Terminate must not declare arguments")
+			return false
+		}
+		if vm.beginUserSubCall(target, nil, true, objID) {
+			if len(vm.callStack) > 0 {
+				vm.callStack[len(vm.callStack)-1].terminateObjID = objID
 			}
-			if vm.beginUserSubCall(target, nil, true, objID) {
-				if len(vm.callStack) > 0 {
-					vm.callStack[len(vm.callStack)-1].terminateObjID = objID
-				}
-				return true
-			}
+			return true
 		}
 	}
 
